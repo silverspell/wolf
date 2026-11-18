@@ -25,9 +25,9 @@ fn unknown_method_id_is_an_error() {
 
 #[test]
 fn unsupported_class_is_an_error() {
-    let wire = Bytes::from(support::frame_bytes(1, 0, &[0x00, 0x14, 0x00, 0x0A]));
+    let wire = Bytes::from(support::frame_bytes(1, 0, &[0x00, 0x3C, 0x00, 0x0A]));
     let error = decode_frame(&wire).unwrap_err();
-    assert_eq!(error, Error::UnsupportedClass { class_id: 20 });
+    assert_eq!(error, Error::UnsupportedClass { class_id: 60 });
 }
 
 #[test]
