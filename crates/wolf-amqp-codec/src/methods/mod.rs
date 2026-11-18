@@ -13,6 +13,7 @@ pub mod exchange;
 pub mod queue;
 pub mod tx;
 
+use basic::BasicMethod;
 use channel::ChannelMethod;
 use confirm::ConfirmMethod;
 use connection::ConnectionMethod;
@@ -51,6 +52,8 @@ pub enum Method {
     Confirm(ConfirmMethod),
     /// A method from the tx class.
     Tx(TxMethod),
+    /// A method from the basic class.
+    Basic(BasicMethod),
 }
 
 impl Method {
@@ -63,6 +66,7 @@ impl Method {
             Self::Queue(method) => method.class_id(),
             Self::Confirm(method) => method.class_id(),
             Self::Tx(method) => method.class_id(),
+            Self::Basic(method) => method.class_id(),
         }
     }
 
@@ -75,6 +79,7 @@ impl Method {
             Self::Queue(method) => method.method_id(),
             Self::Confirm(method) => method.method_id(),
             Self::Tx(method) => method.method_id(),
+            Self::Basic(method) => method.method_id(),
         }
     }
 
@@ -94,6 +99,7 @@ impl Method {
             queue::CLASS_ID => Self::Queue(QueueMethod::decode(method_id, &mut reader)?),
             confirm::CLASS_ID => Self::Confirm(ConfirmMethod::decode(method_id, &mut reader)?),
             tx::CLASS_ID => Self::Tx(TxMethod::decode(method_id, &mut reader)?),
+            basic::CLASS_ID => Self::Basic(BasicMethod::decode(method_id, &mut reader)?),
             other => return Err(Error::UnsupportedClass { class_id: other }),
         };
         if reader.remaining() != 0 {
@@ -116,6 +122,7 @@ impl Method {
             Self::Queue(method) => writer.write_bytes(&method.encode_body()?),
             Self::Confirm(method) => writer.write_bytes(&method.encode_body()?),
             Self::Tx(method) => writer.write_bytes(&method.encode_body()?),
+            Self::Basic(method) => writer.write_bytes(&method.encode_body()?),
         }
         Ok(writer.into_inner())
     }
@@ -165,5 +172,11 @@ impl From<ConfirmMethod> for Method {
 impl From<TxMethod> for Method {
     fn from(method: TxMethod) -> Self {
         Self::Tx(method)
+    }
+}
+
+impl From<BasicMethod> for Method {
+    fn from(method: BasicMethod) -> Self {
+        Self::Basic(method)
     }
 }
