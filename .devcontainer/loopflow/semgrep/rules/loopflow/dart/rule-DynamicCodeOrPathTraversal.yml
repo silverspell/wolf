@@ -1,0 +1,29 @@
+# SPDX-FileCopyrightText: LoopFlow
+# SPDX-License-Identifier: MIT
+# Source: https://github.com/silverspell/LoopFlow-BE
+rules:
+  - id: loopflow-dart-dynamic-code-or-path-traversal
+    languages:
+      - dart
+    severity: WARNING
+    message: >-
+      Applying functions dynamically can execute arbitrary code, and building a
+      file path by concatenation can allow path traversal. Use an explicit
+      dispatch and validate/normalize path segments.
+    metadata:
+      author: "LoopFlow"
+      license: "MIT"
+      category: security
+      cwe:
+        - "CWE-95: Improper Neutralization of Directives in Dynamically Evaluated Code ('Eval Injection')"
+        - "CWE-22: Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')"
+      owasp:
+        - "A03:2021 - Injection"
+        - "A01:2021 - Broken Access Control"
+      confidence: HIGH
+      source: https://github.com/silverspell/LoopFlow-BE
+    pattern-either:
+      - pattern: Function.apply(...)
+      - pattern: $PREFIX.Function.apply(...)
+      - pattern: File($BASE + $CHILD)
+      - pattern: Directory($BASE + $CHILD)

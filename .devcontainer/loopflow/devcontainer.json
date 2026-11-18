@@ -1,0 +1,5 @@
+{
+  "name": "LoopFlow validation",
+  "image": "rust:1-bookworm",
+  "postCreateCommand": "bash .devcontainer/loopflow/semgrep/install-engine.sh"
+}

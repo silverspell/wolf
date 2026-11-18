@@ -1,0 +1,43 @@
+# SPDX-FileCopyrightText: LoopFlow
+# SPDX-License-Identifier: MIT
+# Source: https://github.com/silverspell/LoopFlow-BE
+rules:
+  - id: loopflow-typescript-dynamic-code-or-path-traversal
+    languages:
+      - typescript
+    severity: WARNING
+    message: >-
+      Executing dynamically built code can run arbitrary code, and joining an
+      untrusted path segment can allow path traversal. Use an explicit dispatch
+      and validate/normalize path segments.
+    metadata:
+      author: "LoopFlow"
+      license: "MIT"
+      category: security
+      cwe:
+        - "CWE-95: Improper Neutralization of Directives in Dynamically Evaluated Code ('Eval Injection')"
+        - "CWE-22: Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')"
+      owasp:
+        - "A03:2021 - Injection"
+        - "A01:2021 - Broken Access Control"
+      confidence: HIGH
+      source: https://github.com/silverspell/LoopFlow-BE
+    pattern-either:
+      - patterns:
+          - pattern-either:
+              - pattern: vm.runInNewContext($CODE, ...)
+              - pattern: vm.runInThisContext($CODE, ...)
+              - pattern: vm.runInContext($CODE, ...)
+              - pattern: vm.compileFunction($CODE, ...)
+              - pattern: new vm.Script($CODE, ...)
+          - pattern-not: vm.runInNewContext("...", ...)
+          - pattern-not: vm.runInThisContext("...", ...)
+          - pattern-not: vm.runInContext("...", ...)
+          - pattern-not: vm.compileFunction("...", ...)
+          - pattern-not: new vm.Script("...", ...)
+      - patterns:
+          - pattern-either:
+              - pattern: path.join($BASE, $CHILD, ...)
+              - pattern: path.resolve($BASE, $CHILD, ...)
+          - pattern-not: path.join("...", "...", ...)
+          - pattern-not: path.resolve("...", "...", ...)

@@ -1,0 +1,23 @@
+# SPDX-FileCopyrightText: LoopFlow
+# SPDX-License-Identifier: MIT
+# Source: https://github.com/silverspell/LoopFlow-BE
+rules:
+  - id: loopflow-unsafe-eval
+    languages:
+      - typescript
+    severity: WARNING
+    message: >-
+      Evaluating a string with eval or the Function constructor executes
+      arbitrary code. Avoid dynamic code evaluation and use a safe parser or
+      an explicit lookup instead.
+    metadata:
+      author: "LoopFlow"
+      license: "MIT"
+      category: security
+      cwe: "CWE-95: Improper Neutralization of Directives in Dynamically Evaluated Code ('Eval Injection')"
+      owasp: "A03:2021 - Injection"
+      confidence: HIGH
+      source: https://github.com/silverspell/LoopFlow-BE
+    pattern-either:
+      - pattern: eval(...)
+      - pattern: new Function(...)

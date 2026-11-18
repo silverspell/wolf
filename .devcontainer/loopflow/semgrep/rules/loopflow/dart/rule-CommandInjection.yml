@@ -1,0 +1,27 @@
+# SPDX-FileCopyrightText: LoopFlow
+# SPDX-License-Identifier: MIT
+# Source: https://github.com/silverspell/LoopFlow-BE
+rules:
+  - id: loopflow-dart-command-injection
+    languages:
+      - dart
+    severity: ERROR
+    message: >-
+      Running a process with a non-constant executable can allow OS command
+      injection. Pass a fixed, validated executable and avoid shell execution.
+    metadata:
+      author: "LoopFlow"
+      license: "MIT"
+      category: security
+      cwe: "CWE-78: Improper Neutralization of Special Elements used in an OS Command ('OS Command Injection')"
+      owasp: "A03:2021 - Injection"
+      confidence: HIGH
+      source: https://github.com/silverspell/LoopFlow-BE
+    patterns:
+      - pattern-either:
+          - pattern: Process.run($CMD, ...)
+          - pattern: Process.runSync($CMD, ...)
+          - pattern: Process.start($CMD, ...)
+      - pattern-not: Process.run("...", ...)
+      - pattern-not: Process.runSync("...", ...)
+      - pattern-not: Process.start("...", ...)

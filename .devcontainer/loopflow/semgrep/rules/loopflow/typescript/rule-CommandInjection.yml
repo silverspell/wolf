@@ -1,0 +1,82 @@
+# SPDX-FileCopyrightText: LoopFlow
+# SPDX-License-Identifier: MIT
+# Source: https://github.com/silverspell/LoopFlow-BE
+rules:
+  - id: loopflow-typescript-command-injection
+    languages:
+      - typescript
+    severity: ERROR
+    message: >-
+      Running a process with a non-constant executable or shell command can
+      allow OS command injection. Pass a fixed, validated executable and avoid
+      shell execution with untrusted input.
+    metadata:
+      author: "LoopFlow"
+      license: "MIT"
+      category: security
+      cwe: "CWE-78: Improper Neutralization of Special Elements used in an OS Command ('OS Command Injection')"
+      owasp: "A03:2021 - Injection"
+      confidence: HIGH
+      source: https://github.com/silverspell/LoopFlow-BE
+    patterns:
+      - pattern-either:
+          - patterns:
+              - pattern-either:
+                  - pattern: exec($CMD, ...)
+                  - pattern: execSync($CMD, ...)
+                  - pattern: spawn($CMD, ...)
+                  - pattern: spawnSync($CMD, ...)
+                  - pattern: execFile($CMD, ...)
+                  - pattern: execFileSync($CMD, ...)
+                  - pattern: child_process.exec($CMD, ...)
+                  - pattern: child_process.execSync($CMD, ...)
+                  - pattern: child_process.spawn($CMD, ...)
+                  - pattern: child_process.spawnSync($CMD, ...)
+                  - pattern: child_process.execFile($CMD, ...)
+                  - pattern: child_process.execFileSync($CMD, ...)
+              - pattern-not: exec("...", ...)
+              - pattern-not: exec("...")
+              - pattern-not: execSync("...", ...)
+              - pattern-not: execSync("...")
+              - pattern-not: spawn("...", ...)
+              - pattern-not: spawn("...")
+              - pattern-not: spawnSync("...", ...)
+              - pattern-not: spawnSync("...")
+              - pattern-not: execFile("...", ...)
+              - pattern-not: execFile("...")
+              - pattern-not: execFileSync("...", ...)
+              - pattern-not: execFileSync("...")
+              - pattern-not: child_process.exec("...", ...)
+              - pattern-not: child_process.exec("...")
+              - pattern-not: child_process.execSync("...", ...)
+              - pattern-not: child_process.execSync("...")
+              - pattern-not: child_process.spawn("...", ...)
+              - pattern-not: child_process.spawn("...")
+              - pattern-not: child_process.spawnSync("...", ...)
+              - pattern-not: child_process.spawnSync("...")
+              - pattern-not: child_process.execFile("...", ...)
+              - pattern-not: child_process.execFile("...")
+              - pattern-not: child_process.execFileSync("...", ...)
+              - pattern-not: child_process.execFileSync("...")
+          - pattern-either:
+              - pattern: exec($CMD + $X, ...)
+              - pattern: execSync($CMD + $X, ...)
+              - pattern: spawn($CMD + $X, ...)
+              - pattern: spawnSync($CMD + $X, ...)
+              - pattern: execFile($CMD + $X, ...)
+              - pattern: execFileSync($CMD + $X, ...)
+              - pattern: child_process.exec($CMD + $X, ...)
+              - pattern: child_process.execSync($CMD + $X, ...)
+              - pattern: child_process.spawn($CMD + $X, ...)
+              - pattern: child_process.spawnSync($CMD + $X, ...)
+              - pattern: child_process.execFile($CMD + $X, ...)
+              - pattern: child_process.execFileSync($CMD + $X, ...)
+          - pattern-either:
+              - pattern: spawn("sh", ["-c", $CMD], ...)
+              - pattern: spawn("bash", ["-c", $CMD], ...)
+              - pattern: spawnSync("sh", ["-c", $CMD], ...)
+              - pattern: spawnSync("bash", ["-c", $CMD], ...)
+              - pattern: child_process.spawn("sh", ["-c", $CMD], ...)
+              - pattern: child_process.spawn("bash", ["-c", $CMD], ...)
+              - pattern: child_process.spawnSync("sh", ["-c", $CMD], ...)
+              - pattern: child_process.spawnSync("bash", ["-c", $CMD], ...)

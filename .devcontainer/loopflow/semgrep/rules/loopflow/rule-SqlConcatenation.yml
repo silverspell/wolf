@@ -1,0 +1,29 @@
+# SPDX-FileCopyrightText: LoopFlow
+# SPDX-License-Identifier: MIT
+# Source: https://github.com/silverspell/LoopFlow-BE
+rules:
+  - id: loopflow-sql-concatenation
+    languages:
+      - java
+    severity: WARNING
+    message: >-
+      Building a SQL statement by concatenating values can allow SQL injection.
+      Use a PreparedStatement with bound parameters instead.
+    metadata:
+      author: "LoopFlow"
+      license: "MIT"
+      category: security
+      cwe: "CWE-89: Improper Neutralization of Special Elements used in an SQL Command ('SQL Injection')"
+      owasp: "A03:2021 - Injection"
+      confidence: HIGH
+      source: https://github.com/silverspell/LoopFlow-BE
+    patterns:
+      - pattern-either:
+          - pattern: $STMT.executeQuery($LHS + $RHS, ...)
+          - pattern: $STMT.executeQuery($LHS + $RHS)
+          - pattern: $STMT.executeUpdate($LHS + $RHS, ...)
+          - pattern: $STMT.executeUpdate($LHS + $RHS)
+          - pattern: $STMT.execute($LHS + $RHS, ...)
+          - pattern: $STMT.execute($LHS + $RHS)
+          - pattern: $STMT.executeLargeUpdate($LHS + $RHS, ...)
+          - pattern: $STMT.executeLargeUpdate($LHS + $RHS)

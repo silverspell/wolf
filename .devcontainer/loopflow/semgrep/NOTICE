@@ -1,0 +1,38 @@
+LoopFlow security rule package
+==============================
+
+GitLab SAST rules
+-----------------
+Project: GitLab sast-rules
+Version: v2.10.1
+License: MIT
+Source: https://gitlab.com/gitlab-org/security-products/sast-rules/-/tree/v2.10.1
+Vendored content: the rule files under rules/gitlab/<lang>/ for Java, C#, Go,
+JavaScript and Python. Upstream test fixtures are NOT included for any vendored
+language; upstream .java, .cs, .go, .js, .ts, .tsx and .py fixtures are not
+copied into this repository.
+The JavaScript rules were modified by LoopFlow: "typescript" was added to the
+rule languages so .ts and .tsx sources are scanned as well. The C# rule
+csharp/crypto/rule-CertificateValidationDisabled.yml was modified by LoopFlow:
+the trailing ";" was removed from the lambda pattern "(...) => true", which
+Opengrep v2.0.0 cannot parse and which otherwise fails every scan of the full
+rule set. Those modifications are licensed under MIT.
+The upstream license text is reproduced in LICENSE-GitLab-sast-rules.
+
+Rule package version
+--------------------
+There is no separate package version and no independent
+security_scan_rules_version value or column. The persisted rules_version is the
+first 16 hex characters of the SHA-256 digest built from each rule file's
+relative path and content, taken in sorted order. Adding, removing or editing a
+rule file changes rules_version automatically because the digest changes with
+the rule set.
+
+Opengrep
+--------
+Project: Opengrep
+Version: v2.0.0
+License: LGPL-2.1
+Source: https://github.com/opengrep/opengrep/tree/v2.0.0
+The engine is installed as a pinned binary by the validation image. Its source
+code is not vendored in this repository.
