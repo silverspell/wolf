@@ -1,13 +1,15 @@
 //! AMQP 0-9-1 frame and method encoding/decoding. Pure, no I/O.
 //!
-//! The codec covers the protocol header, frames, field tables and the
-//! connection, confirm and tx method sets. Remaining higher-level classes are
-//! represented by class-id stubs until their tickets land.
+//! The codec covers the protocol header, frames, field tables, basic
+//! content-header properties and the connection, confirm and tx method sets.
+//! Remaining higher-level classes are represented by class-id stubs until their
+//! tickets land.
 
 pub mod error;
 pub mod field_table;
 pub mod frame;
 pub mod methods;
+pub mod properties;
 pub mod types;
 
 pub use error::{Error, Result};
@@ -23,4 +25,5 @@ pub use methods::tx::{
     TxCommit, TxCommitOk, TxMethod, TxRollback, TxRollbackOk, TxSelect, TxSelectOk,
 };
 pub use methods::{Method, confirm, connection, tx};
+pub use properties::BasicProperties;
 pub use types::{LongString, ShortString};
