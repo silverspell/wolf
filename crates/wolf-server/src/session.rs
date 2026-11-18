@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use wolf_amqp_codec::Frame;
-use wolf_broker::Broker;
+use wolf_broker::{Broker, ConnectionId as BrokerConnectionId};
 
 use crate::amqp::MethodKey;
 use crate::amqp::connection::Connection;
@@ -72,7 +72,11 @@ impl Session {
     pub fn new(id: ConnectionId, peer: SocketAddr, broker: Arc<Broker>) -> Self {
         Self {
             id,
-            connection: Connection::new(peer, broker),
+            connection: Connection::with_connection_id(
+                peer,
+                broker,
+                BrokerConnectionId::new(id.get()),
+            ),
         }
     }
 

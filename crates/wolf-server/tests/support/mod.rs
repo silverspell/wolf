@@ -5,13 +5,15 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use bytes::{Buf, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 use wolf_amqp_codec::{
-    ChannelClose, ChannelMethod, ChannelOpen, ChannelOpenOk, Close, ConnectionMethod, FieldTable,
-    Frame, LongString, Method, Open, ProtocolHeader, ShortString, Start, StartOk, Tune, TuneOk,
+    BasicMethod, BasicProperties, BasicPublish, ChannelClose, ChannelCloseOk, ChannelMethod,
+    ChannelOpen, ChannelOpenOk, Close, ConfirmMethod, ConfirmSelect, ConnectionMethod,
+    ContentHeader, FieldTable, Frame, LongString, Method, Open, ProtocolHeader, ShortString, Start,
+    StartOk, Tune, TuneOk,
 };
 use wolf_server::{ServerConfig, ShutdownHandle, start};
 
@@ -242,6 +244,84 @@ impl TestClient {
             Method::Channel(ChannelMethod::OpenOk(open_ok)) => open_ok,
             other => panic!("expected channel.open-ok, got {other:?}"),
         }
+    }
+
+    /// Sends a `basic.publish` method frame.
+    pub async fn send_publish(
+        &mut self,
+        channel: u16,
+        exchange: &str,
+        routing_key: &str,
+        mandatory: bool,
+        immediate: bool,
+    ) {
+        self.send_method(
+            channel,
+            Method::Basic(BasicMethod::Publish(BasicPublish {
+                ticket: 0,
+                exchange: ShortString::new(exchange),
+                routing_key: ShortString::new(routing_key),
+                mandatory,
+                immediate,
+            })),
+        )
+        .await;
+    }
+
+    /// Sends a content header frame.
+    pub async fn send_content_header(&mut self, channel: u16, header: ContentHeader) {
+        self.send_frame(&Frame::ContentHeader { channel, header })
+            .await;
+    }
+
+    /// Sends a content body frame.
+    pub async fn send_content_body(&mut self, channel: u16, body: impl Into<Bytes>) {
+        self.send_frame(&Frame::ContentBody {
+            channel,
+            body: body.into(),
+        })
+        .await;
+    }
+
+    /// Sends a content header followed by a single body frame.
+    pub async fn send_content(&mut self, channel: u16, properties: &BasicProperties, body: &[u8]) {
+        let header = ContentHeader::from_basic_properties(body.len() as u64, properties)
+            .expect("content header encodes");
+        self.send_content_header(channel, header).await;
+        if !body.is_empty() {
+            self.send_content_body(channel, Bytes::copy_from_slice(body))
+                .await;
+        }
+    }
+
+    /// Sends `confirm.select` on a channel.
+    pub async fn select_confirm(&mut self, channel: u16, nowait: bool) {
+        self.send_method(
+            channel,
+            Method::Confirm(ConfirmMethod::Select(ConfirmSelect { nowait })),
+        )
+        .await;
+    }
+
+    /// Reads a server-initiated `channel.close` on the expected channel.
+    pub async fn expect_channel_close(&mut self, expected_channel: u16) -> ChannelClose {
+        loop {
+            let (channel, method) = self.read_method().await;
+            if channel == expected_channel {
+                if let Method::Channel(ChannelMethod::Close(close)) = method {
+                    return close;
+                }
+            }
+        }
+    }
+
+    /// Sends `channel.close-ok` after a server-initiated channel close.
+    pub async fn send_channel_close_ok(&mut self, channel: u16) {
+        self.send_method(
+            channel,
+            Method::Channel(ChannelMethod::CloseOk(ChannelCloseOk)),
+        )
+        .await;
     }
 
     /// Closes a channel and reads `channel.close-ok`.

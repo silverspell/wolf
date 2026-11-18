@@ -1,7 +1,9 @@
 //! AMQP protocol adaptation shared by connection sessions.
 
 pub mod auth;
+pub mod basic_publish;
 pub mod channel;
+pub mod confirm;
 pub mod connection;
 pub mod error;
 

@@ -50,6 +50,8 @@ pub enum ReplyCode {
     PreconditionFailed = 406,
     /// The command is invalid or unknown.
     CommandInvalid = 503,
+    /// A frame arrived that is not valid in the current state.
+    UnexpectedFrame = 505,
     /// The operation is not allowed.
     NotAllowed = 530,
     /// The operation is not implemented.
@@ -69,9 +71,10 @@ impl ReplyCode {
             | Self::NotFound
             | Self::ResourceLocked
             | Self::PreconditionFailed => CloseLevel::Channel,
-            Self::CommandInvalid | Self::NotAllowed | Self::NotImplemented => {
-                CloseLevel::Connection
-            }
+            Self::CommandInvalid
+            | Self::UnexpectedFrame
+            | Self::NotAllowed
+            | Self::NotImplemented => CloseLevel::Connection,
         }
     }
 }
@@ -222,6 +225,7 @@ mod tests {
             (ReplyCode::ResourceLocked, 405),
             (ReplyCode::PreconditionFailed, 406),
             (ReplyCode::CommandInvalid, 503),
+            (ReplyCode::UnexpectedFrame, 505),
             (ReplyCode::NotAllowed, 530),
             (ReplyCode::NotImplemented, 540),
         ];
@@ -241,6 +245,7 @@ mod tests {
         ];
         let connection = [
             ReplyCode::CommandInvalid,
+            ReplyCode::UnexpectedFrame,
             ReplyCode::NotAllowed,
             ReplyCode::NotImplemented,
         ];
