@@ -11,6 +11,7 @@ use wolf_amqp_codec::Frame;
 use wolf_broker::{Broker, ConnectionId as BrokerConnectionId};
 
 use crate::amqp::MethodKey;
+use crate::amqp::auth::Account;
 use crate::amqp::connection::Connection;
 use crate::amqp::error::AmqpError;
 use crate::delivery::{DeliveryHub, ServerEvent};
@@ -71,12 +72,18 @@ pub struct Session {
 
 impl Session {
     /// Creates a session for the given connection identifier and peer.
-    pub fn new(id: ConnectionId, peer: SocketAddr, broker: Arc<Broker>) -> Self {
+    pub fn new(
+        id: ConnectionId,
+        peer: SocketAddr,
+        broker: Arc<Broker>,
+        account: Arc<Account>,
+    ) -> Self {
         Self {
             id,
             connection: Connection::with_connection_id(
                 peer,
                 broker,
+                account,
                 BrokerConnectionId::new(id.get()),
             ),
         }
@@ -87,6 +94,7 @@ impl Session {
         id: ConnectionId,
         peer: SocketAddr,
         broker: Arc<Broker>,
+        account: Arc<Account>,
         hub: Arc<DeliveryHub>,
         outbox: UnboundedSender<ServerEvent>,
     ) -> Self {
@@ -95,6 +103,7 @@ impl Session {
             connection: Connection::with_delivery(
                 peer,
                 broker,
+                account,
                 BrokerConnectionId::new(id.get()),
                 hub,
                 outbox,
@@ -166,7 +175,12 @@ mod tests {
     #[test]
     fn session_delegates_start_and_start_ok_to_the_connection() {
         let peer = "127.0.0.1:1234".parse().expect("valid address");
-        let mut session = Session::new(ConnectionId::new(7), peer, broker());
+        let mut session = Session::new(
+            ConnectionId::new(7),
+            peer,
+            broker(),
+            Arc::new(Account::guest()),
+        );
 
         assert_eq!(session.id(), ConnectionId::new(7));
         assert_eq!(method_id(&session.start_frame()), connection::START);
@@ -190,7 +204,12 @@ mod tests {
     #[test]
     fn heartbeats_keep_the_session_open() {
         let peer = "127.0.0.1:1234".parse().expect("valid address");
-        let mut session = Session::new(ConnectionId::new(8), peer, broker());
+        let mut session = Session::new(
+            ConnectionId::new(8),
+            peer,
+            broker(),
+            Arc::new(Account::guest()),
+        );
 
         let frames = session
             .dispatch(Frame::Heartbeat { channel: 0 })

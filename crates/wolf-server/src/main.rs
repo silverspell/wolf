@@ -7,7 +7,14 @@ use wolf_server::{ServerConfig, start};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    let (addr, shutdown) = start(ServerConfig::default()).await?;
+    let config = match ServerConfig::from_env() {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("wolf configuration error: {error}");
+            std::process::exit(1);
+        }
+    };
+    let (addr, shutdown) = start(config).await?;
     println!("wolf listening on {addr}");
 
     signal::ctrl_c().await?;

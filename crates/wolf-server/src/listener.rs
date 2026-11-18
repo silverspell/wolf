@@ -16,6 +16,7 @@ use tokio::time::{MissedTickBehavior, sleep, timeout};
 use wolf_amqp_codec::{Error as CodecError, Frame, ProtocolHeader, decode_frame};
 use wolf_broker::{Broker, Vhost, VhostId, VhostName};
 
+use crate::amqp::auth::Account;
 use crate::config::ServerConfig;
 use crate::delivery::DeliveryHub;
 use crate::session::{ConnectionId, Session};
@@ -97,8 +98,16 @@ pub async fn start(config: ServerConfig) -> io::Result<(SocketAddr, ShutdownHand
     let active_sessions = Arc::new(AtomicUsize::new(0));
     let session_count = Arc::clone(&active_sessions);
     let hub = Arc::new(DeliveryHub::new());
+    let account = Arc::new(config.account.clone());
 
-    let task = tokio::spawn(accept_loop(listener, receiver, session_count, broker, hub));
+    let task = tokio::spawn(accept_loop(
+        listener,
+        receiver,
+        session_count,
+        broker,
+        hub,
+        account,
+    ));
 
     let handle = ShutdownHandle {
         sender,
@@ -126,6 +135,7 @@ async fn accept_loop(
     active_sessions: Arc<AtomicUsize>,
     broker: Arc<Broker>,
     hub: Arc<DeliveryHub>,
+    account: Arc<Account>,
 ) {
     let mut sessions = JoinSet::new();
 
@@ -139,6 +149,7 @@ async fn accept_loop(
                     let session_shutdown = shutdown.clone();
                     let broker = Arc::clone(&broker);
                     let hub = Arc::clone(&hub);
+                    let account = Arc::clone(&account);
                     sessions.spawn(run_session(
                         stream,
                         peer,
@@ -146,6 +157,7 @@ async fn accept_loop(
                         guard,
                         broker,
                         hub,
+                        account,
                     ));
                 }
                 Err(_) => sleep(RETRY_DELAY).await,
@@ -165,12 +177,14 @@ async fn run_session(
     _guard: SessionGuard,
     broker: Arc<Broker>,
     hub: Arc<DeliveryHub>,
+    account: Arc<Account>,
 ) {
     let (outbox, mut outbox_rx) = hub.subscribe();
     let mut session = Session::with_delivery(
         ConnectionId::generate(),
         peer,
         broker,
+        account,
         Arc::clone(&hub),
         outbox,
     );
