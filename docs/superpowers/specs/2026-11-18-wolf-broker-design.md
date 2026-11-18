@@ -304,16 +304,30 @@ Kapsam:
   RabbitMQ'nun kullandığı reply code'larla düzgün bir hata döner. Sessizce yok
   sayılmaz.
 
-Kabul kriterleri:
+Kabul kriterleri: agent'ların doğrulayacakları (CI/devcontainer, yalnızca Rust):
 
-1. Java `amqp-client` ve Go `amqp091-go` ile yazılmış örnek producer/consumer'lar
-   kodda değişiklik olmadan çalışır. Senaryolar: topic routing (`*` ve `#`),
-   fanout, prefetch ile round-robin dağıtım, nack/requeue, publisher confirms,
-   mandatory/return.
-2. Aynı uyumluluk senaryoları RabbitMQ'ya karşı da koşulur ve aynı sonucu verir.
-3. `rabbitmq-perf-test` değiştirilmeden Wolf'a karşı çalışır. Bu teslimde
+1. `.loopflow.yml` validation adımları (fmt, clippy, test) geçer.
+2. Uçtan uca testler gerçek bir AMQP client'ı olan `lapin` ile yazılır (dev-dependency).
+   Testler Wolf'u process içinde, rastgele bir portta başlatır. Kapsanan senaryolar:
+   topic routing (`*` ve `#`), fanout, direct, prefetch ile round-robin dağıtım,
+   ack, nack/requeue (`redelivered` bayrağı dahil), reject, bağlantı kopunca
+   requeue, publisher confirms, mandatory/return, `basic.get`, passive declare
+   hataları ve desteklenmeyen özelliklerin doğru reply code ile reddedilmesi.
+
+İnsan doğrulaması (ekip yapar, epic'in kapanmasını engellemez):
+
+3. Java `amqp-client` ve Go `amqp091-go` ile yazılmış örnek producer/consumer'lar
+   kodda değişiklik olmadan çalışır. Aynı senaryolar gerçek RabbitMQ'ya karşı da
+   koşulur ve aynı sonucu verir.
+4. `rabbitmq-perf-test` değiştirilmeden Wolf'a karşı çalışır. Bu teslimde
    throughput hedefi yok, sadece sonuç kaydedilir.
-4. `cargo fmt --check`, `cargo clippy -D warnings` ve `cargo test` geçer.
+
+Not: Varsayılan `guest/guest` kullanıcısı RabbitMQ uyumluluğu için bilinçli
+olarak var ve RabbitMQ'daki gibi yalnızca loopback'ten bağlanabilir. Semgrep
+`loopflow-rust-hardcoded-secret-or-insecure-tls` kuralı bunu yakalarsa,
+değişkeni yeniden adlandırarak kuralın etrafından dolaşılmaz. Bunun yerine o
+satıra `// nosemgrep: loopflow-rust-hardcoded-secret-or-insecure-tls` ve
+gerekçesi eklenir.
 
 ## 10. Değerlendirilen yaklaşımlar
 
