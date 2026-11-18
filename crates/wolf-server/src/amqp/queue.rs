@@ -10,6 +10,7 @@ use wolf_broker::{ConnectionId, DomainError, QueueConfig, Vhost};
 use crate::amqp::arguments;
 use crate::amqp::consumer::ConsumerDirectory;
 use crate::amqp::error::AmqpError;
+use crate::delivery::DeliveryHub;
 
 /// Handles `queue.declare`.
 pub fn declare(
@@ -126,6 +127,24 @@ pub fn delete(
     request: QueueDelete,
     consumers: &mut ConsumerDirectory,
 ) -> Result<Vec<Frame>, AmqpError> {
+    let hub = DeliveryHub::new();
+    delete_with_hub(vhost, channel, connection, request, consumers, &hub)
+}
+
+/// Handles `queue.delete`, routing cross-connection cancels through the hub.
+///
+/// Local consumers receive a server-initiated `basic.cancel` frame before the
+/// `queue.delete-ok` reply. Consumers owned by other connections receive the
+/// cancellation through the delivery hub. Consumers without a registered wire
+/// tag are ignored.
+pub fn delete_with_hub(
+    vhost: &Vhost,
+    channel: u16,
+    connection: ConnectionId,
+    request: QueueDelete,
+    consumers: &mut ConsumerDirectory,
+    hub: &DeliveryHub,
+) -> Result<Vec<Frame>, AmqpError> {
     let outcome = vhost
         .delete_queue(
             request.queue.as_str(),
@@ -138,8 +157,10 @@ pub fn delete(
     let mut frames = Vec::new();
     for cancel in outcome.cancels {
         let Some(entry) = consumers.remove(cancel.consumer) else {
+            hub.cancel(cancel);
             continue;
         };
+        hub.unregister(cancel.consumer);
         frames.push(Frame::Method {
             channel: entry.channel,
             method: Method::Basic(BasicMethod::Cancel(BasicCancel {

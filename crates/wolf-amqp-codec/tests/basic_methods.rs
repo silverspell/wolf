@@ -2,8 +2,8 @@ use bytes::Bytes;
 use wolf_amqp_codec::{
     BasicAck, BasicCancel, BasicCancelOk, BasicConsume, BasicConsumeOk, BasicDeliver, BasicGet,
     BasicGetEmpty, BasicGetOk, BasicMethod, BasicNack, BasicPublish, BasicQos, BasicQosOk,
-    BasicReject, BasicReturn, Error, FieldTable, FieldValue, Method, ShortString, basic, basic_ack,
-    basic_consume, basic_publish,
+    BasicRecover, BasicRecoverAsync, BasicRecoverOk, BasicReject, BasicReturn, Error, FieldTable,
+    FieldValue, Method, ShortString, basic, basic_ack, basic_consume, basic_publish, basic_recover,
 };
 
 fn sample_arguments() -> FieldTable {
@@ -680,4 +680,50 @@ fn unknown_method_id_is_an_error() {
             method_id: 99,
         }
     );
+}
+
+#[test]
+fn recover_method_ids_and_exact_wire_bytes() {
+    assert_eq!(
+        [
+            basic_recover::RECOVER_ASYNC,
+            basic_recover::RECOVER,
+            basic_recover::RECOVER_OK,
+        ],
+        [100, 110, 111]
+    );
+
+    assert_eq!(
+        Method::Basic(BasicMethod::RecoverAsync(BasicRecoverAsync {
+            requeue: true,
+        }))
+        .encode(),
+        vec![0x00, 0x3C, 0x00, 0x64, 0x01]
+    );
+    assert_eq!(
+        Method::Basic(BasicMethod::Recover(BasicRecover { requeue: true })).encode(),
+        vec![0x00, 0x3C, 0x00, 0x6E, 0x01]
+    );
+    assert_eq!(
+        Method::Basic(BasicMethod::RecoverOk(BasicRecoverOk)).encode(),
+        vec![0x00, 0x3C, 0x00, 0x6F]
+    );
+}
+
+#[test]
+fn recover_methods_round_trip_every_requeue_value() {
+    for requeue in [false, true] {
+        let async_method = Method::Basic(BasicMethod::RecoverAsync(BasicRecoverAsync { requeue }));
+        let encoded = async_method.encode();
+        assert_eq!(encoded[4], u8::from(requeue));
+        assert_eq!(Method::decode(&Bytes::from(encoded)).unwrap(), async_method);
+
+        let sync_method = Method::Basic(BasicMethod::Recover(BasicRecover { requeue }));
+        let encoded = sync_method.encode();
+        assert_eq!(encoded[4], u8::from(requeue));
+        assert_eq!(Method::decode(&Bytes::from(encoded)).unwrap(), sync_method);
+    }
+
+    let ok = Method::Basic(BasicMethod::RecoverOk(BasicRecoverOk));
+    assert_eq!(Method::decode(&Bytes::from(ok.encode())).unwrap(), ok);
 }

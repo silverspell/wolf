@@ -4,6 +4,8 @@
 //! wire protocol they speak. `basic.cancel` is represented only as a
 //! [`ConsumerCancel`] with an opaque consumer id and a domain [`CancelReason`].
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use crate::message::Message;
 
 /// An opaque consumer identifier.
@@ -13,6 +15,12 @@ pub struct ConsumerId(u64);
 impl ConsumerId {
     pub fn new(raw: u64) -> Self {
         Self(raw)
+    }
+
+    /// Generates a process-local consumer identifier.
+    pub fn generate() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        Self(NEXT.fetch_add(1, Ordering::Relaxed))
     }
 
     pub fn get(self) -> u64 {
@@ -27,6 +35,12 @@ pub struct ChannelId(u64);
 impl ChannelId {
     pub fn new(raw: u64) -> Self {
         Self(raw)
+    }
+
+    /// Generates a process-local channel identifier.
+    pub fn generate() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        Self(NEXT.fetch_add(1, Ordering::Relaxed))
     }
 
     pub fn get(self) -> u64 {

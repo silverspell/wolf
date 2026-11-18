@@ -1,5 +1,7 @@
 //! Per-channel AMQP state owned by a connection.
 
+use wolf_broker::ChannelId;
+
 use crate::amqp::basic_publish::PendingPublish;
 use crate::amqp::confirm::ConfirmState;
 
@@ -8,6 +10,8 @@ use crate::amqp::confirm::ConfirmState;
 pub struct Channel {
     /// The channel number.
     pub number: u16,
+    /// Process-local broker channel identifier used by the domain dispatcher.
+    pub broker_id: ChannelId,
     /// Whether content flow is currently active.
     pub flow_active: bool,
     /// The publish currently being assembled, if any.
@@ -20,8 +24,14 @@ pub struct Channel {
 impl Channel {
     /// Creates an open channel that starts with content flow active.
     pub fn new(number: u16) -> Self {
+        Self::with_broker_id(number, ChannelId::generate())
+    }
+
+    /// Creates an open channel with an explicit broker channel identifier.
+    pub fn with_broker_id(number: u16, broker_id: ChannelId) -> Self {
         Self {
             number,
+            broker_id,
             flow_active: true,
             pending_publish: None,
             confirm: ConfirmState::new(),
@@ -32,6 +42,11 @@ impl Channel {
     /// Returns the channel number.
     pub const fn number(&self) -> u16 {
         self.number
+    }
+
+    /// Returns the process-local broker channel identifier.
+    pub const fn broker_id(&self) -> ChannelId {
+        self.broker_id
     }
 
     /// Returns whether content flow is currently active.

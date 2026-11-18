@@ -2,6 +2,9 @@
 
 pub mod arguments;
 pub mod auth;
+pub mod basic_ack;
+pub mod basic_consume;
+pub mod basic_get;
 pub mod basic_publish;
 pub mod channel;
 pub mod confirm;

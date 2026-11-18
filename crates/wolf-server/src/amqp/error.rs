@@ -137,6 +137,18 @@ impl AmqpError {
         error
     }
 
+    /// Builds a channel-level error, even for reply codes that normally close
+    /// only the connection (notably `530 NOT_ALLOWED` for consumer tags).
+    pub fn channel(reply_code: ReplyCode, text: impl Into<String>) -> Self {
+        let mut error = Self::new(reply_code, text);
+        error.close_level = CloseLevel::Channel;
+        error.class_id = CloseLevel::Channel.class_id();
+        error.method_id = CloseLevel::Channel.method_id();
+        error.offending_class_id = CloseLevel::Channel.class_id();
+        error.offending_method_id = CloseLevel::Channel.method_id();
+        error
+    }
+
     /// Sets the class and method ids reported in the close frame payload.
     pub fn with_offending(mut self, class_id: u16, method_id: u16) -> Self {
         self.offending_class_id = class_id;

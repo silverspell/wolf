@@ -4,10 +4,14 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 
 use crate::binding::QueueName;
+use crate::consumer::{ConsumerDispatcher, ConsumerOptions, SettleOutcome};
+use crate::delivery::{ChannelId, ConsumerId, CreditSignal, DeliverySink, DeliveryTag};
 use crate::error::DomainError;
 use crate::exchange::ExchangeConfig;
-use crate::publish::{PublishOutcome, PublishRequest, publish};
-use crate::queue::{ConnectionId, QueueConfig, QueueDeleteOutcome, QueueRegistry};
+use crate::publish::{GetOutcome, PublishOutcome, PublishRequest, publish};
+use crate::queue::{
+    ConnectionCloseOutcome, ConnectionId, QueueConfig, QueueDeleteOutcome, QueueRegistry,
+};
 use crate::router::Router;
 
 /// A validated virtual host name.
@@ -55,6 +59,7 @@ impl VhostId {
 struct VhostState {
     router: Router,
     queues: QueueRegistry,
+    dispatcher: ConsumerDispatcher,
     destinations: Vec<QueueName>,
 }
 
@@ -84,6 +89,7 @@ impl Vhost {
             state: Mutex::new(VhostState {
                 router,
                 queues,
+                dispatcher: ConsumerDispatcher::new(),
                 destinations: Vec::new(),
             }),
         }
@@ -107,9 +113,165 @@ impl Vhost {
         let VhostState {
             router,
             queues,
+            dispatcher: _,
             destinations,
         } = &mut *state;
         publish(router, queues, destinations, connection, request)
+    }
+
+    /// Registers a consumer on a queue.
+    pub fn consume(
+        &self,
+        connection: ConnectionId,
+        channel: ChannelId,
+        consumer: ConsumerId,
+        queue: impl AsRef<str>,
+        options: ConsumerOptions,
+    ) -> Result<(), DomainError> {
+        let mut state = self.state.lock().map_err(|_| DomainError::BrokerClosed)?;
+        let VhostState {
+            dispatcher, queues, ..
+        } = &mut *state;
+        dispatcher.register_with(queues, connection, channel, consumer, queue, options)
+    }
+
+    /// Cancels a consumer, returning whether it was registered.
+    pub fn cancel(&self, consumer: ConsumerId) -> Result<bool, DomainError> {
+        let mut state = self.state.lock().map_err(|_| DomainError::BrokerClosed)?;
+        let VhostState {
+            dispatcher, queues, ..
+        } = &mut *state;
+        dispatcher.cancel(queues, consumer)
+    }
+
+    /// Applies a prefetch limit to a channel and returns credit signals.
+    pub fn set_prefetch(
+        &self,
+        channel: ChannelId,
+        prefetch_count: u32,
+        global: bool,
+    ) -> Result<Vec<CreditSignal>, DomainError> {
+        let mut state = self.state.lock().map_err(|_| DomainError::BrokerClosed)?;
+        Ok(state
+            .dispatcher
+            .set_prefetch(channel, prefetch_count, global))
+    }
+
+    /// Fetches one message for `basic.get`.
+    pub fn get(
+        &self,
+        connection: ConnectionId,
+        channel: ChannelId,
+        queue: impl AsRef<str>,
+        no_ack: bool,
+    ) -> Result<GetOutcome, DomainError> {
+        let mut state = self.state.lock().map_err(|_| DomainError::BrokerClosed)?;
+        let VhostState {
+            dispatcher, queues, ..
+        } = &mut *state;
+        dispatcher.get(queues, connection, channel, queue, no_ack)
+    }
+
+    /// Acknowledges one delivery or every delivery up to the tag.
+    pub fn ack(
+        &self,
+        channel: ChannelId,
+        delivery_tag: DeliveryTag,
+        multiple: bool,
+    ) -> Result<SettleOutcome, DomainError> {
+        let mut state = self.state.lock().map_err(|_| DomainError::BrokerClosed)?;
+        state.dispatcher.ack(channel, delivery_tag, multiple)
+    }
+
+    /// Rejects one delivery or every delivery up to the tag.
+    pub fn nack(
+        &self,
+        channel: ChannelId,
+        delivery_tag: DeliveryTag,
+        multiple: bool,
+        requeue: bool,
+    ) -> Result<SettleOutcome, DomainError> {
+        let mut state = self.state.lock().map_err(|_| DomainError::BrokerClosed)?;
+        let VhostState {
+            dispatcher, queues, ..
+        } = &mut *state;
+        dispatcher.nack(queues, channel, delivery_tag, multiple, requeue)
+    }
+
+    /// Rejects a single delivery.
+    pub fn reject(
+        &self,
+        channel: ChannelId,
+        delivery_tag: DeliveryTag,
+        requeue: bool,
+    ) -> Result<SettleOutcome, DomainError> {
+        let mut state = self.state.lock().map_err(|_| DomainError::BrokerClosed)?;
+        let VhostState {
+            dispatcher, queues, ..
+        } = &mut *state;
+        dispatcher.reject(queues, channel, delivery_tag, requeue)
+    }
+
+    /// Requeues every unacknowledged delivery on a channel.
+    pub fn recover(&self, channel: ChannelId) -> Result<SettleOutcome, DomainError> {
+        let mut state = self.state.lock().map_err(|_| DomainError::BrokerClosed)?;
+        let VhostState {
+            dispatcher, queues, ..
+        } = &mut *state;
+        dispatcher.recover(queues, channel)
+    }
+
+    /// Dispatches ready messages for one queue to the given sink.
+    pub fn dispatch(
+        &self,
+        queue: impl AsRef<str>,
+        sink: &mut dyn DeliverySink,
+    ) -> Result<usize, DomainError> {
+        let mut state = self.state.lock().map_err(|_| DomainError::BrokerClosed)?;
+        let VhostState {
+            dispatcher, queues, ..
+        } = &mut *state;
+        dispatcher.dispatch(queues, queue, sink)
+    }
+
+    /// Dispatches ready messages for every queue in this virtual host.
+    pub fn dispatch_all(&self, sink: &mut dyn DeliverySink) -> Result<usize, DomainError> {
+        let mut state = self.state.lock().map_err(|_| DomainError::BrokerClosed)?;
+        let names: Vec<String> = state
+            .queues
+            .iter()
+            .map(|(name, _)| name.as_str().to_string())
+            .collect();
+        let VhostState {
+            dispatcher, queues, ..
+        } = &mut *state;
+        let mut delivered = 0;
+        for name in names {
+            delivered += dispatcher.dispatch(queues, name, sink)?;
+        }
+        Ok(delivered)
+    }
+
+    /// Requeues unacknowledged deliveries on a closing channel and removes its
+    /// consumers.
+    pub fn close_channel(&self, channel: ChannelId) -> Result<SettleOutcome, DomainError> {
+        let mut state = self.state.lock().map_err(|_| DomainError::BrokerClosed)?;
+        let VhostState {
+            dispatcher, queues, ..
+        } = &mut *state;
+        dispatcher.close_channel(queues, channel)
+    }
+
+    /// Requeues unacknowledged deliveries for a closed connection and removes
+    /// its consumers.
+    pub fn close_connection(&self, connection: ConnectionId) -> ConnectionCloseOutcome {
+        let Ok(mut state) = self.state.lock() else {
+            return ConnectionCloseOutcome::default();
+        };
+        let VhostState {
+            dispatcher, queues, ..
+        } = &mut *state;
+        dispatcher.close_connection(queues, connection)
     }
 
     /// Returns the number of messages currently stored in `queue`.
@@ -309,7 +471,17 @@ impl Vhost {
             }
         }
 
-        state.queues.delete(name, connection)
+        let VhostState {
+            dispatcher, queues, ..
+        } = &mut *state;
+        let outcome = queues.delete(name, connection)?;
+        let cancelled: Vec<ConsumerId> = outcome
+            .cancels
+            .iter()
+            .map(|cancel| cancel.consumer)
+            .collect();
+        dispatcher.forget_consumers(&cancelled);
+        Ok(outcome)
     }
 }
 

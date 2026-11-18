@@ -10,6 +10,8 @@ pub mod basic_ack;
 pub mod basic_consume;
 #[path = "basic_publish.rs"]
 pub mod basic_publish;
+#[path = "basic_recover.rs"]
+pub mod basic_recover;
 
 pub use basic_ack::{ACK, BasicAck, BasicNack, BasicReject, NACK, REJECT};
 pub use basic_consume::{
@@ -18,6 +20,9 @@ pub use basic_consume::{
     DELIVER, GET, GET_EMPTY, GET_OK, QOS, QOS_OK,
 };
 pub use basic_publish::{BasicPublish, BasicReturn, PUBLISH, RETURN};
+pub use basic_recover::{
+    BasicRecover, BasicRecoverAsync, BasicRecoverOk, RECOVER, RECOVER_ASYNC, RECOVER_OK,
+};
 
 /// AMQP Basic class id.
 pub const CLASS_ID: u16 = 60;
@@ -55,6 +60,12 @@ pub enum BasicMethod {
     Reject(BasicReject),
     /// `basic.nack`
     Nack(BasicNack),
+    /// `basic.recover-async`
+    RecoverAsync(BasicRecoverAsync),
+    /// `basic.recover`
+    Recover(BasicRecover),
+    /// `basic.recover-ok`
+    RecoverOk(BasicRecoverOk),
 }
 
 impl BasicMethod {
@@ -81,6 +92,9 @@ impl BasicMethod {
             Self::Ack(_) => ACK,
             Self::Reject(_) => REJECT,
             Self::Nack(_) => NACK,
+            Self::RecoverAsync(_) => RECOVER_ASYNC,
+            Self::Recover(_) => RECOVER,
+            Self::RecoverOk(_) => RECOVER_OK,
         }
     }
 
@@ -161,6 +175,13 @@ impl BasicMethod {
                 writer.write_u64(method.delivery_tag);
                 writer.write_u8(pack_bits(&[method.multiple, method.requeue]));
             }
+            Self::RecoverAsync(method) => {
+                writer.write_u8(pack_bits(&[method.requeue]));
+            }
+            Self::Recover(method) => {
+                writer.write_u8(pack_bits(&[method.requeue]));
+            }
+            Self::RecoverOk(_) => {}
         }
         Ok(writer.into_inner())
     }
@@ -261,6 +282,13 @@ impl BasicMethod {
                     requeue: bit_set(bits, 1),
                 })
             }
+            RECOVER_ASYNC => Self::RecoverAsync(BasicRecoverAsync {
+                requeue: bit_set(reader.read_u8()?, 0),
+            }),
+            RECOVER => Self::Recover(BasicRecover {
+                requeue: bit_set(reader.read_u8()?, 0),
+            }),
+            RECOVER_OK => Self::RecoverOk(BasicRecoverOk),
             other => {
                 return Err(Error::UnknownMethod {
                     class_id: CLASS_ID,

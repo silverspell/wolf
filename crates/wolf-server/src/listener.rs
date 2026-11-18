@@ -17,6 +17,7 @@ use wolf_amqp_codec::{Error as CodecError, Frame, ProtocolHeader, decode_frame};
 use wolf_broker::{Broker, Vhost, VhostId, VhostName};
 
 use crate::config::ServerConfig;
+use crate::delivery::DeliveryHub;
 use crate::session::{ConnectionId, Session};
 
 const RETRY_DELAY: Duration = Duration::from_millis(10);
@@ -95,8 +96,9 @@ pub async fn start(config: ServerConfig) -> io::Result<(SocketAddr, ShutdownHand
     let (sender, receiver) = watch::channel(false);
     let active_sessions = Arc::new(AtomicUsize::new(0));
     let session_count = Arc::clone(&active_sessions);
+    let hub = Arc::new(DeliveryHub::new());
 
-    let task = tokio::spawn(accept_loop(listener, receiver, session_count, broker));
+    let task = tokio::spawn(accept_loop(listener, receiver, session_count, broker, hub));
 
     let handle = ShutdownHandle {
         sender,
@@ -123,6 +125,7 @@ async fn accept_loop(
     mut shutdown: watch::Receiver<bool>,
     active_sessions: Arc<AtomicUsize>,
     broker: Arc<Broker>,
+    hub: Arc<DeliveryHub>,
 ) {
     let mut sessions = JoinSet::new();
 
@@ -135,7 +138,15 @@ async fn accept_loop(
                     let guard = SessionGuard::new(Arc::clone(&active_sessions));
                     let session_shutdown = shutdown.clone();
                     let broker = Arc::clone(&broker);
-                    sessions.spawn(run_session(stream, peer, session_shutdown, guard, broker));
+                    let hub = Arc::clone(&hub);
+                    sessions.spawn(run_session(
+                        stream,
+                        peer,
+                        session_shutdown,
+                        guard,
+                        broker,
+                        hub,
+                    ));
                 }
                 Err(_) => sleep(RETRY_DELAY).await,
             },
@@ -153,8 +164,16 @@ async fn run_session(
     mut shutdown: watch::Receiver<bool>,
     _guard: SessionGuard,
     broker: Arc<Broker>,
+    hub: Arc<DeliveryHub>,
 ) {
-    let mut session = Session::new(ConnectionId::generate(), peer, broker);
+    let (outbox, mut outbox_rx) = hub.subscribe();
+    let mut session = Session::with_delivery(
+        ConnectionId::generate(),
+        peer,
+        broker,
+        Arc::clone(&hub),
+        outbox,
+    );
     let mut buffer = BytesMut::with_capacity(1024);
     let mut read_buffer = [0u8; 4096];
     let mut header_done = false;
@@ -174,6 +193,21 @@ async fn run_session(
                     }
                     last_heartbeat = std::time::Instant::now();
                 }
+            },
+            event = outbox_rx.recv() => match event {
+                Some(event) => match session.delivery_event(event) {
+                    Ok(frames) => {
+                        if write_frames(&mut stream, &frames).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        let close = error.to_frame(0);
+                        let _ = write_frame(&mut stream, &close).await;
+                        break;
+                    }
+                },
+                None => break,
             },
             read = stream.read(&mut read_buffer) => match read {
                 Ok(0) | Err(_) => break,
@@ -204,6 +238,7 @@ async fn run_session(
         }
     }
 
+    session.shutdown();
     let _ = stream.shutdown().await;
 }
 

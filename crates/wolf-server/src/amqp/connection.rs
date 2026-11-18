@@ -4,15 +4,18 @@ use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use tokio::sync::mpsc::UnboundedSender;
 use wolf_amqp_codec::{
-    BasicMethod, BasicPublish, ChannelCloseOk, ChannelFlowOk, ChannelMethod, ChannelOpenOk,
-    CloseOk, ConfirmMethod, ConnectionMethod, ContentHeader, ExchangeMethod, FieldTable,
-    FieldValue, Frame, LongString, Method, OpenOk, QueueMethod, ShortString, Start, StartOk, Tune,
-    TuneOk, basic, channel, confirm, connection, exchange, queue,
+    BasicAck, BasicCancel, BasicConsume, BasicGet, BasicMethod, BasicNack, BasicPublish, BasicQos,
+    BasicRecover, BasicRecoverAsync, BasicReject, ChannelCloseOk, ChannelFlowOk, ChannelMethod,
+    ChannelOpenOk, CloseOk, ConfirmMethod, ConnectionMethod, ContentHeader, ExchangeMethod,
+    FieldTable, FieldValue, Frame, LongString, Method, OpenOk, QueueMethod, ShortString, Start,
+    StartOk, Tune, TuneOk, basic, basic_ack, basic_consume, basic_recover, channel, confirm,
+    connection, exchange, queue,
 };
 use wolf_broker::{
-    Broker, ConnectionId as BrokerConnectionId, Message, PublishOutcome, PublishRequest, Vhost,
-    VhostName,
+    Broker, ChannelId, ConnectionId as BrokerConnectionId, Message, MessageMetadata,
+    PublishOutcome, PublishRequest, Vhost, VhostName,
 };
 
 use crate::amqp::auth::{self, AuthError};
@@ -21,7 +24,12 @@ use crate::amqp::channel::Channel;
 use crate::amqp::confirm::ConfirmState;
 use crate::amqp::consumer::ConsumerDirectory;
 use crate::amqp::error::{AmqpError, CloseLevel, ReplyCode};
-use crate::amqp::{exchange as exchange_handler, queue as queue_handler, unsupported};
+use crate::amqp::{
+    basic_ack as basic_ack_handler, basic_consume as basic_consume_handler,
+    basic_get as basic_get_handler, exchange as exchange_handler, queue as queue_handler,
+    unsupported,
+};
+use crate::delivery::{DeliveryHub, ServerEvent};
 
 /// Default maximum number of channels advertised in `connection.tune`.
 pub const DEFAULT_CHANNEL_MAX: u16 = 2047;
@@ -63,6 +71,9 @@ pub struct Connection {
     heartbeat: u16,
     vhost: Option<VhostName>,
     consumers: ConsumerDirectory,
+    hub: Arc<DeliveryHub>,
+    outbox: UnboundedSender<ServerEvent>,
+    cleaned: bool,
 }
 
 impl Connection {
@@ -78,6 +89,19 @@ impl Connection {
         broker: Arc<Broker>,
         broker_connection: BrokerConnectionId,
     ) -> Self {
+        let hub = Arc::new(DeliveryHub::new());
+        let (outbox, _receiver) = hub.subscribe();
+        Self::with_delivery(peer, broker, broker_connection, hub, outbox)
+    }
+
+    /// Creates a connection that routes deliveries through a shared hub.
+    pub fn with_delivery(
+        peer: SocketAddr,
+        broker: Arc<Broker>,
+        broker_connection: BrokerConnectionId,
+        hub: Arc<DeliveryHub>,
+        outbox: UnboundedSender<ServerEvent>,
+    ) -> Self {
         Self {
             state: State::AwaitingStartOk,
             peer,
@@ -89,6 +113,9 @@ impl Connection {
             heartbeat: DEFAULT_HEARTBEAT,
             vhost: None,
             consumers: ConsumerDirectory::new(),
+            hub,
+            outbox,
+            cleaned: false,
         }
     }
 
@@ -210,6 +237,13 @@ impl Connection {
         match result {
             Ok(frames) => Ok(frames),
             Err(error) if error.close_level == CloseLevel::Channel => {
+                if let Some(broker_channel) = self
+                    .channels
+                    .get(&frame_channel)
+                    .map(|channel| channel.broker_id)
+                {
+                    self.cleanup_channel(frame_channel, broker_channel);
+                }
                 if let Some(channel) = self.channels.get_mut(&frame_channel) {
                     channel.begin_close();
                 }
@@ -235,6 +269,7 @@ impl Connection {
                 self.handle_open(open.virtual_host, open.insist)
             }
             (State::Open, ConnectionMethod::Close(_)) => {
+                self.cleanup_connection();
                 self.state = State::Closed;
                 Ok(vec![Frame::Method {
                     channel: 0,
@@ -242,6 +277,7 @@ impl Connection {
                 }])
             }
             (_, ConnectionMethod::Close(_)) => {
+                self.cleanup_connection();
                 self.state = State::Closed;
                 Ok(vec![Frame::Method {
                     channel: 0,
@@ -357,6 +393,21 @@ impl Connection {
             Method::Basic(BasicMethod::Publish(publish)) => {
                 self.basic_publish(frame_channel, publish)
             }
+            Method::Basic(BasicMethod::Qos(qos)) => self.basic_qos(frame_channel, qos),
+            Method::Basic(BasicMethod::Consume(consume)) => {
+                self.basic_consume(frame_channel, consume)
+            }
+            Method::Basic(BasicMethod::Cancel(cancel)) => self.basic_cancel(frame_channel, cancel),
+            Method::Basic(BasicMethod::Get(get)) => self.basic_get(frame_channel, get),
+            Method::Basic(BasicMethod::Ack(ack)) => self.basic_ack(frame_channel, ack),
+            Method::Basic(BasicMethod::Nack(nack)) => self.basic_nack(frame_channel, nack),
+            Method::Basic(BasicMethod::Reject(reject)) => self.basic_reject(frame_channel, reject),
+            Method::Basic(BasicMethod::Recover(recover)) => {
+                self.basic_recover(frame_channel, recover)
+            }
+            Method::Basic(BasicMethod::RecoverAsync(recover)) => {
+                self.basic_recover_async(frame_channel, recover)
+            }
             Method::Exchange(ExchangeMethod::Declare(declare)) => {
                 self.exchange_declare(frame_channel, declare)
             }
@@ -370,6 +421,11 @@ impl Connection {
             Method::Queue(QueueMethod::Unbind(unbind)) => self.queue_unbind(frame_channel, unbind),
             Method::Queue(QueueMethod::Purge(purge)) => self.queue_purge(frame_channel, purge),
             Method::Queue(QueueMethod::Delete(delete)) => self.queue_delete(frame_channel, delete),
+            Method::Basic(method) => Err(self.command_invalid(
+                basic::CLASS_ID,
+                method.method_id(),
+                "client sent a server-only basic method",
+            )),
             Method::Exchange(method) => Err(self.command_invalid(
                 exchange::CLASS_ID,
                 method.method_id(),
@@ -459,12 +515,13 @@ impl Connection {
         let vhost = broker.vhost(&name).map_err(|error| {
             AmqpError::from_domain(&error).with_offending(queue::CLASS_ID, queue::DELETE)
         })?;
-        queue_handler::delete(
+        queue_handler::delete_with_hub(
             vhost,
             frame_channel,
             self.broker_connection,
             request,
             &mut self.consumers,
+            &self.hub,
         )
     }
 
@@ -585,20 +642,28 @@ impl Connection {
         frame_channel: u16,
         completed: CompletedPublish,
     ) -> Result<Vec<Frame>, AmqpError> {
-        let Some(vhost) = self.vhost.clone() else {
+        let Some(vhost_name) = self.vhost.clone() else {
             return Err(self.command_invalid(0, 0, "connection has no open vhost"));
         };
+        let broker = Arc::clone(&self.broker);
+        let vhost = broker.vhost(&vhost_name).map_err(|error| {
+            AmqpError::from_domain(&error).with_offending(basic::CLASS_ID, basic::PUBLISH)
+        })?;
+        let metadata = MessageMetadata::new(
+            completed.method().exchange.as_str(),
+            completed.method().routing_key.as_str(),
+            completed.property_bytes(),
+        );
         let request = PublishRequest {
             exchange: completed.method().exchange.as_str(),
             routing_key: completed.method().routing_key.as_str(),
             mandatory: completed.method().mandatory,
-            message: Message::new(completed.body().clone()),
+            message: Message::with_metadata(completed.body().clone(), metadata),
             properties: completed.properties().clone(),
         };
 
-        let outcome = self
-            .broker
-            .publish(&vhost, self.broker_connection, request)
+        let outcome = broker
+            .publish(&vhost_name, self.broker_connection, request)
             .map_err(|error| {
                 AmqpError::from_domain(&error).with_offending(basic::CLASS_ID, basic::PUBLISH)
             })?;
@@ -610,6 +675,10 @@ impl Connection {
             PublishOutcome::Routed { .. } | PublishOutcome::Dropped => Vec::new(),
         };
 
+        vhost.dispatch_all(&mut self.hub.sink()).map_err(|error| {
+            AmqpError::from_domain(&error).with_offending(basic::CLASS_ID, basic::PUBLISH)
+        })?;
+
         if let Some(channel) = self.channels.get_mut(&frame_channel) {
             channel.pending_publish = None;
             if let Some(sequence) = channel.confirm.next_publish_sequence() {
@@ -618,6 +687,253 @@ impl Connection {
         }
 
         Ok(frames)
+    }
+
+    fn vhost_name(&self, class_id: u16, method_id: u16) -> Result<VhostName, AmqpError> {
+        self.vhost.clone().ok_or_else(|| {
+            self.command_invalid(class_id, method_id, "connection has no open vhost")
+        })
+    }
+
+    fn channel_broker_id(
+        &self,
+        frame_channel: u16,
+        class_id: u16,
+        method_id: u16,
+    ) -> Result<ChannelId, AmqpError> {
+        self.channels
+            .get(&frame_channel)
+            .map(|channel| channel.broker_id)
+            .ok_or_else(|| self.command_invalid(class_id, method_id, "channel is not open"))
+    }
+
+    fn basic_qos(
+        &mut self,
+        frame_channel: u16,
+        request: BasicQos,
+    ) -> Result<Vec<Frame>, AmqpError> {
+        let broker_channel =
+            self.channel_broker_id(frame_channel, basic::CLASS_ID, basic_consume::QOS)?;
+        let name = self.vhost_name(basic::CLASS_ID, basic_consume::QOS)?;
+        let broker = Arc::clone(&self.broker);
+        let vhost = broker.vhost(&name).map_err(|error| {
+            AmqpError::from_domain(&error).with_offending(basic::CLASS_ID, basic_consume::QOS)
+        })?;
+        basic_consume_handler::qos(vhost, broker_channel, &self.hub, frame_channel, request)
+    }
+
+    fn basic_consume(
+        &mut self,
+        frame_channel: u16,
+        request: BasicConsume,
+    ) -> Result<Vec<Frame>, AmqpError> {
+        let broker_channel =
+            self.channel_broker_id(frame_channel, basic::CLASS_ID, basic_consume::CONSUME)?;
+        let name = self.vhost_name(basic::CLASS_ID, basic_consume::CONSUME)?;
+        let broker = Arc::clone(&self.broker);
+        let vhost = broker.vhost(&name).map_err(|error| {
+            AmqpError::from_domain(&error).with_offending(basic::CLASS_ID, basic_consume::CONSUME)
+        })?;
+        basic_consume_handler::consume(
+            vhost,
+            &mut self.consumers,
+            &self.hub,
+            &self.outbox,
+            frame_channel,
+            broker_channel,
+            self.broker_connection,
+            request,
+        )
+    }
+
+    fn basic_cancel(
+        &mut self,
+        frame_channel: u16,
+        request: BasicCancel,
+    ) -> Result<Vec<Frame>, AmqpError> {
+        let name = self.vhost_name(basic::CLASS_ID, basic_consume::CANCEL)?;
+        let broker = Arc::clone(&self.broker);
+        let vhost = broker.vhost(&name).map_err(|error| {
+            AmqpError::from_domain(&error).with_offending(basic::CLASS_ID, basic_consume::CANCEL)
+        })?;
+        basic_consume_handler::cancel(
+            vhost,
+            &mut self.consumers,
+            &self.hub,
+            frame_channel,
+            request,
+        )
+    }
+
+    fn basic_get(
+        &mut self,
+        frame_channel: u16,
+        request: BasicGet,
+    ) -> Result<Vec<Frame>, AmqpError> {
+        let broker_channel =
+            self.channel_broker_id(frame_channel, basic::CLASS_ID, basic_consume::GET)?;
+        let name = self.vhost_name(basic::CLASS_ID, basic_consume::GET)?;
+        let broker = Arc::clone(&self.broker);
+        let vhost = broker.vhost(&name).map_err(|error| {
+            AmqpError::from_domain(&error).with_offending(basic::CLASS_ID, basic_consume::GET)
+        })?;
+        basic_get_handler::get(
+            vhost,
+            frame_channel,
+            broker_channel,
+            self.broker_connection,
+            self.frame_max,
+            request,
+        )
+    }
+
+    fn basic_ack(
+        &mut self,
+        frame_channel: u16,
+        request: BasicAck,
+    ) -> Result<Vec<Frame>, AmqpError> {
+        let broker_channel =
+            self.channel_broker_id(frame_channel, basic::CLASS_ID, basic_ack::ACK)?;
+        let name = self.vhost_name(basic::CLASS_ID, basic_ack::ACK)?;
+        let broker = Arc::clone(&self.broker);
+        let vhost = broker.vhost(&name).map_err(|error| {
+            AmqpError::from_domain(&error).with_offending(basic::CLASS_ID, basic_ack::ACK)
+        })?;
+        basic_ack_handler::ack(vhost, broker_channel, &self.hub, request)
+    }
+
+    fn basic_nack(
+        &mut self,
+        frame_channel: u16,
+        request: BasicNack,
+    ) -> Result<Vec<Frame>, AmqpError> {
+        let broker_channel =
+            self.channel_broker_id(frame_channel, basic::CLASS_ID, basic_ack::NACK)?;
+        let name = self.vhost_name(basic::CLASS_ID, basic_ack::NACK)?;
+        let broker = Arc::clone(&self.broker);
+        let vhost = broker.vhost(&name).map_err(|error| {
+            AmqpError::from_domain(&error).with_offending(basic::CLASS_ID, basic_ack::NACK)
+        })?;
+        basic_ack_handler::nack(vhost, broker_channel, &self.hub, request)
+    }
+
+    fn basic_reject(
+        &mut self,
+        frame_channel: u16,
+        request: BasicReject,
+    ) -> Result<Vec<Frame>, AmqpError> {
+        let broker_channel =
+            self.channel_broker_id(frame_channel, basic::CLASS_ID, basic_ack::REJECT)?;
+        let name = self.vhost_name(basic::CLASS_ID, basic_ack::REJECT)?;
+        let broker = Arc::clone(&self.broker);
+        let vhost = broker.vhost(&name).map_err(|error| {
+            AmqpError::from_domain(&error).with_offending(basic::CLASS_ID, basic_ack::REJECT)
+        })?;
+        basic_ack_handler::reject(vhost, broker_channel, &self.hub, request)
+    }
+
+    fn basic_recover(
+        &mut self,
+        frame_channel: u16,
+        request: BasicRecover,
+    ) -> Result<Vec<Frame>, AmqpError> {
+        let broker_channel =
+            self.channel_broker_id(frame_channel, basic::CLASS_ID, basic_recover::RECOVER)?;
+        let name = self.vhost_name(basic::CLASS_ID, basic_recover::RECOVER)?;
+        let broker = Arc::clone(&self.broker);
+        let vhost = broker.vhost(&name).map_err(|error| {
+            AmqpError::from_domain(&error).with_offending(basic::CLASS_ID, basic_recover::RECOVER)
+        })?;
+        basic_ack_handler::recover(vhost, broker_channel, &self.hub, frame_channel, request)
+    }
+
+    fn basic_recover_async(
+        &mut self,
+        frame_channel: u16,
+        request: BasicRecoverAsync,
+    ) -> Result<Vec<Frame>, AmqpError> {
+        let broker_channel =
+            self.channel_broker_id(frame_channel, basic::CLASS_ID, basic_recover::RECOVER_ASYNC)?;
+        let name = self.vhost_name(basic::CLASS_ID, basic_recover::RECOVER_ASYNC)?;
+        let broker = Arc::clone(&self.broker);
+        let vhost = broker.vhost(&name).map_err(|error| {
+            AmqpError::from_domain(&error)
+                .with_offending(basic::CLASS_ID, basic_recover::RECOVER_ASYNC)
+        })?;
+        basic_ack_handler::recover_async(vhost, broker_channel, &self.hub, request)
+    }
+
+    /// Handles a delivery or cancellation routed to this connection.
+    pub fn delivery_event(&mut self, event: ServerEvent) -> Result<Vec<Frame>, AmqpError> {
+        match event {
+            ServerEvent::Delivery(delivery) => {
+                let frame_max = self.frame_max;
+                let Some(entry) = self.consumers.get(delivery.consumer) else {
+                    return Ok(Vec::new());
+                };
+                basic_consume_handler::delivery_frames(
+                    entry.channel,
+                    frame_max,
+                    &entry.tag,
+                    &delivery,
+                )
+            }
+            ServerEvent::Cancel(cancel) => {
+                self.hub.unregister(cancel.consumer);
+                Ok(self
+                    .consumers
+                    .remove(cancel.consumer)
+                    .map(|entry| {
+                        vec![basic_consume_handler::cancel_frame(
+                            entry.channel,
+                            entry.tag,
+                        )]
+                    })
+                    .unwrap_or_default())
+            }
+        }
+    }
+
+    /// Cleans up broker consumer state and unacked deliveries for one channel.
+    fn cleanup_channel(&mut self, frame_channel: u16, broker_channel: ChannelId) {
+        let Some(name) = self.vhost.clone() else {
+            for (consumer, _) in self.consumers.remove_channel(frame_channel) {
+                self.hub.unregister(consumer);
+            }
+            return;
+        };
+        let broker = Arc::clone(&self.broker);
+        if let Ok(vhost) = broker.vhost(&name) {
+            let _ = vhost.close_channel(broker_channel);
+            for (consumer, _) in self.consumers.remove_channel(frame_channel) {
+                self.hub.unregister(consumer);
+            }
+            let _ = vhost.dispatch_all(&mut self.hub.sink());
+        } else {
+            for (consumer, _) in self.consumers.remove_channel(frame_channel) {
+                self.hub.unregister(consumer);
+            }
+        }
+    }
+
+    /// Cleans up all broker state owned by this connection. Idempotent.
+    pub fn cleanup_connection(&mut self) {
+        if self.cleaned {
+            return;
+        }
+        self.cleaned = true;
+
+        if let Some(name) = self.vhost.clone() {
+            let broker = Arc::clone(&self.broker);
+            if let Ok(vhost) = broker.vhost(&name) {
+                let _ = vhost.close_connection(self.broker_connection);
+                let _ = vhost.dispatch_all(&mut self.hub.sink());
+            }
+        }
+        for (consumer, _) in self.consumers.drain() {
+            self.hub.unregister(consumer);
+        }
+        self.channels.clear();
     }
 
     fn open_channel(&mut self, frame_channel: u16) -> Result<Vec<Frame>, AmqpError> {
@@ -646,13 +962,19 @@ impl Connection {
     }
 
     fn close_channel(&mut self, frame_channel: u16) -> Result<Vec<Frame>, AmqpError> {
-        if self.channels.remove(&frame_channel).is_none() {
+        let Some(broker_channel) = self
+            .channels
+            .get(&frame_channel)
+            .map(|channel| channel.broker_id)
+        else {
             return Err(self.command_invalid(
                 channel::CLASS_ID,
                 channel::CLOSE,
                 "channel is not open",
             ));
-        }
+        };
+        self.cleanup_channel(frame_channel, broker_channel);
+        self.channels.remove(&frame_channel);
         Ok(vec![Frame::Method {
             channel: frame_channel,
             method: Method::Channel(ChannelMethod::CloseOk(ChannelCloseOk)),

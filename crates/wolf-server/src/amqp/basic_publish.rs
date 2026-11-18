@@ -147,6 +147,14 @@ impl CompletedPublish {
         &self.properties
     }
 
+    /// Returns the opaque encoded content-header property bytes.
+    ///
+    /// These are preserved verbatim so consumer deliveries reproduce the
+    /// publisher's properties without re-encoding them.
+    pub fn property_bytes(&self) -> Bytes {
+        self.header.properties.clone()
+    }
+
     /// Returns the assembled body, sharing the original allocation when it
     /// arrived in a single chunk.
     pub fn body(&self) -> &Bytes {
