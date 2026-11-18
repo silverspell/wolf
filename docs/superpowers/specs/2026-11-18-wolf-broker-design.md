@@ -281,6 +281,9 @@ bu yüzden paralel ticket'lar olarak yürütülebilirler.
 
 ### 9.1 İlk teslim: M1 — "basic RabbitMQ klonu" (ilk Cellvoy epic'i)
 
+Jira: epic `WOLF` projesinde (byteflow.atlassian.net) açılır. Epic yalnızca bu
+bölümü kapsar. M2–M6 bağlam içindir, bu epic'e ticket olarak girmez.
+
 M1 tek başına teslim edilebilir bir üründür: gerçek RabbitMQ client'larının
 bağlanabildiği, mesajları bellekte tutan bir broker. Kalıcılık, TTL, DLX ve
 stream'ler bu teslimde **yoktur**.
