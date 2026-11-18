@@ -25,3 +25,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 cargo run -p wolf-server
 ```
+
+## License
+
+MIT, see [`LICENSE`](LICENSE).
