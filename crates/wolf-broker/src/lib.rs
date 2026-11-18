@@ -43,4 +43,4 @@ pub use queue::{
 };
 pub use topic::{RoutingKey, TopicPattern, TopicTrie};
 pub use validation::{QueueArguments, UNSUPPORTED_QUEUE_ARGUMENTS, validate_queue_arguments};
-pub use vhost::{Vhost, VhostId, VhostName};
+pub use vhost::{QueueDeclaration, Vhost, VhostId, VhostName};
