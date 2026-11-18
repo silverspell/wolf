@@ -65,22 +65,61 @@ impl VhostId {
 
 type Dispatcher = Arc<Mutex<ConsumerDispatcher>>;
 
-struct DeliveryCommand {
-    sink: Box<dyn DeliverySink + Send>,
-    reply: oneshot::Sender<Result<usize, DomainError>>,
+/// The default capacity of the bounded channel feeding each queue task.
+pub const DEFAULT_QUEUE_CHANNEL_CAPACITY: usize = 64;
+
+/// Configuration for a virtual host's per-queue task channels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VhostConfig {
+    queue_channel_capacity: usize,
+}
+
+impl VhostConfig {
+    /// Creates a configuration with the given queue channel capacity.
+    ///
+    /// A capacity of zero is clamped to one so every queue task has room for
+    /// at least one pending command.
+    pub fn new(queue_channel_capacity: usize) -> Self {
+        Self {
+            queue_channel_capacity: queue_channel_capacity.max(1),
+        }
+    }
+
+    /// Returns the capacity of each queue task's bounded channel.
+    pub fn queue_channel_capacity(&self) -> usize {
+        self.queue_channel_capacity
+    }
+}
+
+impl Default for VhostConfig {
+    fn default() -> Self {
+        Self::new(DEFAULT_QUEUE_CHANNEL_CAPACITY)
+    }
+}
+
+enum QueueCommand {
+    Enqueue {
+        connection: ConnectionId,
+        message: Message,
+        reply: oneshot::Sender<Result<(), DomainError>>,
+    },
+    Deliver {
+        sink: Box<dyn DeliverySink + Send>,
+        reply: oneshot::Sender<Result<usize, DomainError>>,
+    },
 }
 
 struct QueueSlot {
     queue: Arc<Mutex<Queue>>,
-    sender: mpsc::UnboundedSender<DeliveryCommand>,
-    receiver: Mutex<Option<mpsc::UnboundedReceiver<DeliveryCommand>>>,
+    sender: mpsc::Sender<QueueCommand>,
+    receiver: Mutex<Option<mpsc::Receiver<QueueCommand>>>,
     dispatcher: Dispatcher,
     task: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl QueueSlot {
-    fn new(queue: Queue, dispatcher: Dispatcher) -> Self {
-        let (sender, receiver) = mpsc::unbounded_channel();
+    fn new(queue: Queue, dispatcher: Dispatcher, capacity: usize) -> Self {
+        let (sender, receiver) = mpsc::channel(capacity);
         Self {
             queue: Arc::new(Mutex::new(queue)),
             sender,
@@ -114,14 +153,37 @@ impl QueueSlot {
 fn spawn_queue_task(
     queue: Arc<Mutex<Queue>>,
     dispatcher: Dispatcher,
-    mut receiver: mpsc::UnboundedReceiver<DeliveryCommand>,
+    mut receiver: mpsc::Receiver<QueueCommand>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(command) = receiver.recv().await {
-            let result = deliver_ready(&queue, &dispatcher, command.sink);
-            let _ = command.reply.send(result);
+            match command {
+                QueueCommand::Enqueue {
+                    connection,
+                    message,
+                    reply,
+                } => {
+                    let result = enqueue_message(&queue, connection, message);
+                    let _ = reply.send(result);
+                }
+                QueueCommand::Deliver { sink, reply } => {
+                    let result = deliver_ready(&queue, &dispatcher, sink);
+                    let _ = reply.send(result);
+                }
+            }
         }
     })
+}
+
+fn enqueue_message(
+    queue: &Mutex<Queue>,
+    connection: ConnectionId,
+    message: Message,
+) -> Result<(), DomainError> {
+    let mut queue = queue.lock().map_err(|_| DomainError::BrokerClosed)?;
+    queue.check_access(connection)?;
+    queue.push_message(message);
+    Ok(())
 }
 
 fn deliver_ready(
@@ -153,6 +215,7 @@ pub struct Vhost {
     queues: Mutex<BTreeMap<QueueName, Arc<QueueSlot>>>,
     dispatcher: Dispatcher,
     next_server_name: AtomicU64,
+    queue_channel_capacity: usize,
 }
 
 impl fmt::Debug for Vhost {
@@ -166,7 +229,12 @@ impl fmt::Debug for Vhost {
 
 impl Vhost {
     pub fn new(id: VhostId, name: VhostName) -> Self {
-        Self::with_routing(id, name, Router::default(), QueueRegistry::new())
+        Self::with_config(id, name, VhostConfig::default())
+    }
+
+    /// Creates a virtual host with an explicit queue channel configuration.
+    pub fn with_config(id: VhostId, name: VhostName, config: VhostConfig) -> Self {
+        Self::with_routing_and_config(id, name, Router::default(), QueueRegistry::new(), config)
     }
 
     /// Creates a virtual host with caller-supplied routing state.
@@ -176,13 +244,29 @@ impl Vhost {
         router: Router,
         queues: QueueRegistry,
     ) -> Self {
+        Self::with_routing_and_config(id, name, router, queues, VhostConfig::default())
+    }
+
+    /// Creates a virtual host with caller-supplied routing state and configuration.
+    pub fn with_routing_and_config(
+        id: VhostId,
+        name: VhostName,
+        router: Router,
+        queues: QueueRegistry,
+        config: VhostConfig,
+    ) -> Self {
+        let queue_channel_capacity = config.queue_channel_capacity();
         let dispatcher = Arc::new(Mutex::new(ConsumerDispatcher::new()));
         let slots: BTreeMap<QueueName, Arc<QueueSlot>> = queues
             .iter()
             .map(|(name, queue)| {
                 (
                     name.clone(),
-                    Arc::new(QueueSlot::new(queue.clone(), Arc::clone(&dispatcher))),
+                    Arc::new(QueueSlot::new(
+                        queue.clone(),
+                        Arc::clone(&dispatcher),
+                        queue_channel_capacity,
+                    )),
                 )
             })
             .collect();
@@ -200,6 +284,7 @@ impl Vhost {
             queues: Mutex::new(slots),
             dispatcher,
             next_server_name: AtomicU64::new(0),
+            queue_channel_capacity,
         }
     }
 
@@ -267,9 +352,17 @@ impl Vhost {
         }
 
         for slot in &slots {
-            let mut queue = self.lock_queue(slot)?;
-            queue.check_access(connection)?;
-            queue.push_message(request.message.clone());
+            slot.ensure_task();
+            let (reply, response) = oneshot::channel();
+            slot.sender
+                .send(QueueCommand::Enqueue {
+                    connection,
+                    message: request.message.clone(),
+                    reply,
+                })
+                .await
+                .map_err(|_| DomainError::BrokerClosed)?;
+            response.await.map_err(|_| DomainError::BrokerClosed)??;
         }
 
         Ok(PublishOutcome::Routed {
@@ -432,10 +525,11 @@ impl Vhost {
         slot.ensure_task();
         let (reply, response) = oneshot::channel();
         slot.sender
-            .send(DeliveryCommand {
+            .send(QueueCommand::Deliver {
                 sink: Box::new(sink),
                 reply,
             })
+            .await
             .map_err(|_| DomainError::BrokerClosed)?;
         response.await.map_err(|_| DomainError::BrokerClosed)?
     }
@@ -456,10 +550,11 @@ impl Vhost {
             slot.ensure_task();
             let (reply, response) = oneshot::channel();
             slot.sender
-                .send(DeliveryCommand {
+                .send(QueueCommand::Deliver {
                     sink: Box::new(sink.clone()),
                     reply,
                 })
+                .await
                 .map_err(|_| DomainError::BrokerClosed)?;
             pending.push(response);
         }
@@ -682,7 +777,11 @@ impl Vhost {
             let mut queues = self.queues.lock().map_err(|_| DomainError::BrokerClosed)?;
             let queue_name = self.generate_server_name(&queues);
             let queue = Queue::new(queue_name.clone(), config, connection);
-            let slot = Arc::new(QueueSlot::new(queue, Arc::clone(&self.dispatcher)));
+            let slot = Arc::new(QueueSlot::new(
+                queue,
+                Arc::clone(&self.dispatcher),
+                self.queue_channel_capacity,
+            ));
             queues.insert(queue_name.clone(), Arc::clone(&slot));
             drop(queues);
             slot.ensure_task();
@@ -714,7 +813,11 @@ impl Vhost {
                 None => {
                     validate_queue_arguments(&config.arguments)?;
                     let queue = Queue::new(queue_name.clone(), config, connection);
-                    let slot = Arc::new(QueueSlot::new(queue, Arc::clone(&self.dispatcher)));
+                    let slot = Arc::new(QueueSlot::new(
+                        queue,
+                        Arc::clone(&self.dispatcher),
+                        self.queue_channel_capacity,
+                    ));
                     self.queues
                         .lock()
                         .map_err(|_| DomainError::BrokerClosed)?
