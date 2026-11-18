@@ -1,7 +1,7 @@
 use bytes::Bytes;
 use wolf_amqp_codec::{
-    ChannelClose, ChannelCloseOk, ChannelMethod, ChannelOpen, ChannelOpenOk, Error, LongString,
-    Method, ShortString, channel,
+    ChannelClose, ChannelCloseOk, ChannelFlow, ChannelFlowOk, ChannelMethod, ChannelOpen,
+    ChannelOpenOk, Error, LongString, Method, ShortString, channel,
 };
 
 fn sample_methods() -> Vec<(ChannelMethod, u16)> {
@@ -17,6 +17,14 @@ fn sample_methods() -> Vec<(ChannelMethod, u16)> {
                 reserved: LongString::from(b"hb".to_vec()),
             }),
             channel::OPEN_OK,
+        ),
+        (
+            ChannelMethod::Flow(ChannelFlow { active: true }),
+            channel::FLOW,
+        ),
+        (
+            ChannelMethod::FlowOk(ChannelFlowOk { active: false }),
+            channel::FLOW_OK,
         ),
         (
             ChannelMethod::Close(ChannelClose {
@@ -35,6 +43,8 @@ fn variant_name(method: &ChannelMethod) -> &'static str {
     match method {
         ChannelMethod::Open(_) => "open",
         ChannelMethod::OpenOk(_) => "open-ok",
+        ChannelMethod::Flow(_) => "flow",
+        ChannelMethod::FlowOk(_) => "flow-ok",
         ChannelMethod::Close(_) => "close",
         ChannelMethod::CloseOk(_) => "close-ok",
     }
@@ -47,10 +57,12 @@ fn method_ids_match_amqp_spec() {
             channel::CLASS_ID,
             channel::OPEN,
             channel::OPEN_OK,
+            channel::FLOW,
+            channel::FLOW_OK,
             channel::CLOSE,
             channel::CLOSE_OK,
         ),
-        (20, 10, 11, 40, 41)
+        (20, 10, 11, 20, 21, 40, 41)
     );
 }
 
@@ -68,6 +80,14 @@ fn methods_encode_exact_wire_bytes() {
                 reserved: LongString::from(b"hb".to_vec()),
             })),
             vec![0x00, 0x14, 0x00, 0x0B, 0x00, 0x00, 0x00, 0x02, b'h', b'b'],
+        ),
+        (
+            Method::Channel(ChannelMethod::Flow(ChannelFlow { active: true })),
+            vec![0x00, 0x14, 0x00, 0x14, 0x01],
+        ),
+        (
+            Method::Channel(ChannelMethod::FlowOk(ChannelFlowOk { active: false })),
+            vec![0x00, 0x14, 0x00, 0x15, 0x00],
         ),
         (
             Method::Channel(ChannelMethod::Close(ChannelClose {

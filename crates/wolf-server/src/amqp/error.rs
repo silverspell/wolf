@@ -2,6 +2,9 @@
 
 use std::fmt;
 
+use wolf_amqp_codec::{
+    ChannelClose, ChannelMethod, Close, ConnectionMethod, Frame, Method, ShortString,
+};
 use wolf_broker::DomainError;
 
 use crate::session::DispatchError;
@@ -96,6 +99,10 @@ pub struct AmqpError {
     pub class_id: u16,
     /// AMQP method id of the resulting close method.
     pub method_id: u16,
+    /// AMQP class id of the offending method.
+    pub offending_class_id: u16,
+    /// AMQP method id of the offending method.
+    pub offending_method_id: u16,
     /// Human-readable explanation sent to the peer.
     pub text: String,
 }
@@ -109,7 +116,56 @@ impl AmqpError {
             close_level,
             class_id: close_level.class_id(),
             method_id: close_level.method_id(),
+            offending_class_id: close_level.class_id(),
+            offending_method_id: close_level.method_id(),
             text: text.into(),
+        }
+    }
+
+    /// Builds a connection-level error, even for reply codes that normally
+    /// close only a channel (notably `403 ACCESS_REFUSED` during auth).
+    pub fn connection(reply_code: ReplyCode, text: impl Into<String>) -> Self {
+        let mut error = Self::new(reply_code, text);
+        error.close_level = CloseLevel::Connection;
+        error.class_id = CloseLevel::Connection.class_id();
+        error.method_id = CloseLevel::Connection.method_id();
+        error.offending_class_id = CloseLevel::Connection.class_id();
+        error.offending_method_id = CloseLevel::Connection.method_id();
+        error
+    }
+
+    /// Sets the class and method ids reported in the close frame payload.
+    pub fn with_offending(mut self, class_id: u16, method_id: u16) -> Self {
+        self.offending_class_id = class_id;
+        self.offending_method_id = method_id;
+        self
+    }
+
+    /// Encodes this error as a connection or channel close frame.
+    ///
+    /// Connection-level errors always use channel 0. Channel-level errors use
+    /// the supplied channel number.
+    pub fn to_frame(&self, channel: u16) -> Frame {
+        let reply_text = ShortString::new(self.text.clone());
+        match self.close_level {
+            CloseLevel::Connection => Frame::Method {
+                channel: 0,
+                method: Method::Connection(ConnectionMethod::Close(Close {
+                    reply_code: self.reply_code.code(),
+                    reply_text,
+                    class_id: self.offending_class_id,
+                    method_id: self.offending_method_id,
+                })),
+            },
+            CloseLevel::Channel => Frame::Method {
+                channel,
+                method: Method::Channel(ChannelMethod::Close(ChannelClose {
+                    reply_code: self.reply_code.code(),
+                    reply_text,
+                    class_id: self.offending_class_id,
+                    method_id: self.offending_method_id,
+                })),
+            },
         }
     }
 
@@ -283,5 +339,47 @@ mod tests {
         assert_eq!(error.close_level, CloseLevel::Connection);
         assert_eq!(error.class_id, 10);
         assert_eq!(error.method_id, 50);
+    }
+
+    #[test]
+    fn connection_level_errors_encode_connection_close_on_channel_zero() {
+        let error = AmqpError::connection(ReplyCode::NotAllowed, "no vhost").with_offending(10, 40);
+        let frame = error.to_frame(7);
+
+        let Frame::Method { channel, method } = frame else {
+            panic!("expected a method frame");
+        };
+        assert_eq!(channel, 0);
+        let Method::Connection(ConnectionMethod::Close(close)) = method else {
+            panic!("expected connection.close");
+        };
+        assert_eq!(close.reply_code, 530);
+        assert_eq!(close.class_id, 10);
+        assert_eq!(close.method_id, 40);
+    }
+
+    #[test]
+    fn access_refused_can_be_forced_to_connection_level() {
+        let error = AmqpError::connection(ReplyCode::AccessRefused, "auth failed");
+        assert_eq!(error.close_level, CloseLevel::Connection);
+        assert_eq!(error.class_id, 10);
+        assert_eq!(error.method_id, 50);
+    }
+
+    #[test]
+    fn channel_level_errors_encode_channel_close_on_the_requested_channel() {
+        let error = AmqpError::new(ReplyCode::NotFound, "missing").with_offending(50, 10);
+        let frame = error.to_frame(3);
+
+        let Frame::Method { channel, method } = frame else {
+            panic!("expected a method frame");
+        };
+        assert_eq!(channel, 3);
+        let Method::Channel(ChannelMethod::Close(close)) = method else {
+            panic!("expected channel.close");
+        };
+        assert_eq!(close.reply_code, 404);
+        assert_eq!(close.class_id, 50);
+        assert_eq!(close.method_id, 10);
     }
 }

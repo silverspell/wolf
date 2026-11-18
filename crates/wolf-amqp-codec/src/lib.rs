@@ -29,7 +29,8 @@ pub use methods::basic::{
 };
 pub use methods::basic::{basic_ack, basic_consume, basic_publish};
 pub use methods::channel::{
-    ChannelClose, ChannelCloseOk, ChannelMethod, ChannelOpen, ChannelOpenOk,
+    ChannelClose, ChannelCloseOk, ChannelFlow, ChannelFlowOk, ChannelMethod, ChannelOpen,
+    ChannelOpenOk,
 };
 pub use methods::confirm::{ConfirmMethod, ConfirmSelect, ConfirmSelectOk};
 pub use methods::connection::{

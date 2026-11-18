@@ -7,17 +7,20 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use tokio::io::AsyncReadExt;
+use bytes::{Buf, BytesMut};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, watch};
 use tokio::task::{JoinError, JoinHandle, JoinSet};
-use tokio::time::{sleep, timeout};
+use tokio::time::{MissedTickBehavior, sleep, timeout};
+use wolf_amqp_codec::{Error as CodecError, Frame, ProtocolHeader, decode_frame};
+use wolf_broker::{Broker, Vhost, VhostId, VhostName};
 
-use crate::amqp::MethodKey;
 use crate::config::ServerConfig;
 use crate::session::{ConnectionId, Session};
 
 const RETRY_DELAY: Duration = Duration::from_millis(10);
+const HEARTBEAT_TICK: Duration = Duration::from_millis(250);
 
 /// Failure while waiting for the server to shut down.
 #[derive(Debug)]
@@ -86,13 +89,14 @@ impl ShutdownHandle {
 
 /// Binds the AMQP listener and starts accepting connections.
 pub async fn start(config: ServerConfig) -> io::Result<(SocketAddr, ShutdownHandle)> {
+    let broker = default_broker()?;
     let listener = TcpListener::bind(config.amqp_addr).await?;
     let local_addr = listener.local_addr()?;
     let (sender, receiver) = watch::channel(false);
     let active_sessions = Arc::new(AtomicUsize::new(0));
     let session_count = Arc::clone(&active_sessions);
 
-    let task = tokio::spawn(accept_loop(listener, receiver, session_count));
+    let task = tokio::spawn(accept_loop(listener, receiver, session_count, broker));
 
     let handle = ShutdownHandle {
         sender,
@@ -104,10 +108,21 @@ pub async fn start(config: ServerConfig) -> io::Result<(SocketAddr, ShutdownHand
     Ok((local_addr, handle))
 }
 
+fn default_broker() -> io::Result<Arc<Broker>> {
+    let mut broker = Broker::new();
+    let name = VhostName::new("/")
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
+    broker
+        .add_vhost(Vhost::new(VhostId::new(1), name))
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
+    Ok(Arc::new(broker))
+}
+
 async fn accept_loop(
     listener: TcpListener,
     mut shutdown: watch::Receiver<bool>,
     active_sessions: Arc<AtomicUsize>,
+    broker: Arc<Broker>,
 ) {
     let mut sessions = JoinSet::new();
 
@@ -116,10 +131,11 @@ async fn accept_loop(
             biased;
             () = wait_for_shutdown(&mut shutdown) => break,
             accepted = listener.accept() => match accepted {
-                Ok((stream, _peer)) => {
+                Ok((stream, peer)) => {
                     let guard = SessionGuard::new(Arc::clone(&active_sessions));
                     let session_shutdown = shutdown.clone();
-                    sessions.spawn(run_session(stream, session_shutdown, guard));
+                    let broker = Arc::clone(&broker);
+                    sessions.spawn(run_session(stream, peer, session_shutdown, guard, broker));
                 }
                 Err(_) => sleep(RETRY_DELAY).await,
             },
@@ -133,24 +149,122 @@ async fn accept_loop(
 
 async fn run_session(
     mut stream: TcpStream,
+    peer: SocketAddr,
     mut shutdown: watch::Receiver<bool>,
     _guard: SessionGuard,
+    broker: Arc<Broker>,
 ) {
-    let mut session = Session::new(ConnectionId::generate());
-    let mut buffer = [0u8; 1024];
+    let mut session = Session::new(ConnectionId::generate(), peer, broker);
+    let mut buffer = BytesMut::with_capacity(1024);
+    let mut read_buffer = [0u8; 4096];
+    let mut header_done = false;
+    let mut heartbeat = tokio::time::interval(HEARTBEAT_TICK);
+    heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut last_heartbeat = std::time::Instant::now();
 
     loop {
         tokio::select! {
             biased;
             () = wait_for_shutdown(&mut shutdown) => break,
-            read = stream.read(&mut buffer) => match read {
+            _ = heartbeat.tick() => {
+                let interval = session.heartbeat_interval();
+                if !interval.is_zero() && last_heartbeat.elapsed() >= interval / 2 {
+                    if write_frame(&mut stream, &Frame::Heartbeat { channel: 0 }).await.is_err() {
+                        break;
+                    }
+                    last_heartbeat = std::time::Instant::now();
+                }
+            },
+            read = stream.read(&mut read_buffer) => match read {
                 Ok(0) | Err(_) => break,
-                Ok(_) => {
-                    let _ = session.dispatch(MethodKey::new(0, 0));
+                Ok(read) => {
+                    buffer.extend_from_slice(&read_buffer[..read]);
+                    if !header_done {
+                        if buffer.len() < ProtocolHeader::BYTES.len() {
+                            continue;
+                        }
+                        if ProtocolHeader::decode(&buffer[..ProtocolHeader::BYTES.len()]).is_err() {
+                            let _ = stream.write_all(&ProtocolHeader::BYTES).await;
+                            break;
+                        }
+                        buffer.advance(ProtocolHeader::BYTES.len());
+                        header_done = true;
+                        if write_frame(&mut stream, &session.start_frame()).await.is_err() {
+                            break;
+                        }
+                    }
+
+                    match process_buffer(&mut session, &mut stream, &mut buffer).await {
+                        Ok(ProcessOutcome::Continue) => {}
+                        Ok(ProcessOutcome::Close) => break,
+                        Ok(ProcessOutcome::IoError) | Err(()) => break,
+                    }
                 }
             },
         }
     }
+
+    let _ = stream.shutdown().await;
+}
+
+enum ProcessOutcome {
+    Continue,
+    Close,
+    IoError,
+}
+
+async fn process_buffer(
+    session: &mut Session,
+    stream: &mut TcpStream,
+    buffer: &mut BytesMut,
+) -> Result<ProcessOutcome, ()> {
+    let mut data = buffer.split().freeze();
+    loop {
+        if data.is_empty() {
+            return Ok(ProcessOutcome::Continue);
+        }
+        match decode_frame(&data) {
+            Ok((frame, used)) => {
+                data.advance(used);
+                match session.dispatch(frame) {
+                    Ok(frames) => {
+                        if write_frames(stream, &frames).await.is_err() {
+                            return Ok(ProcessOutcome::IoError);
+                        }
+                        if session.is_closed() {
+                            return Ok(ProcessOutcome::Close);
+                        }
+                    }
+                    Err(error) => {
+                        let close = error.to_frame(0);
+                        if write_frame(stream, &close).await.is_err() {
+                            return Ok(ProcessOutcome::IoError);
+                        }
+                        return Ok(ProcessOutcome::Close);
+                    }
+                }
+            }
+            Err(CodecError::Incomplete { .. }) => {
+                buffer.extend_from_slice(&data);
+                return Ok(ProcessOutcome::Continue);
+            }
+            Err(_) => return Err(()),
+        }
+    }
+}
+
+async fn write_frames(stream: &mut TcpStream, frames: &[Frame]) -> io::Result<()> {
+    for frame in frames {
+        write_frame(stream, frame).await?;
+    }
+    Ok(())
+}
+
+async fn write_frame(stream: &mut TcpStream, frame: &Frame) -> io::Result<()> {
+    let bytes = frame
+        .try_encode()
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    stream.write_all(&bytes).await
 }
 
 async fn wait_for_shutdown(shutdown: &mut watch::Receiver<bool>) {
