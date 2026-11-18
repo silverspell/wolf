@@ -9,6 +9,9 @@ use crate::types::{Reader, Writer};
 /// The frame terminator octet.
 pub const FRAME_END: u8 = 0xCE;
 
+/// The fixed frame overhead: a seven-byte header plus the frame-end octet.
+pub const FRAME_OVERHEAD: usize = 8;
+
 /// Maximum accepted frame payload size (16 MiB).
 pub const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
 
@@ -220,6 +223,27 @@ impl Frame {
 
     /// Encodes the frame, returning an error for values that exceed AMQP limits.
     pub fn try_encode(&self) -> Result<Vec<u8>> {
+        if let Self::ContentBody { channel, body } = self {
+            if body.len() > MAX_FRAME_SIZE {
+                return Err(Error::FrameTooLarge {
+                    size: body.len(),
+                    max: MAX_FRAME_SIZE,
+                });
+            }
+            let size = u32::try_from(body.len()).map_err(|_| Error::FrameTooLarge {
+                size: body.len(),
+                max: u32::MAX as usize,
+            })?;
+
+            let mut output = Vec::with_capacity(FRAME_OVERHEAD + body.len());
+            output.push(FrameType::ContentBody.as_u8());
+            output.extend_from_slice(&channel.to_be_bytes());
+            output.extend_from_slice(&size.to_be_bytes());
+            output.extend_from_slice(body);
+            output.push(FRAME_END);
+            return Ok(output);
+        }
+
         let (frame_type, channel, payload) = match self {
             Self::Method { channel, method } => (FrameType::Method, *channel, method.try_encode()?),
             Self::ContentHeader { channel, header } => {
@@ -230,8 +254,8 @@ impl Frame {
                 writer.write_bytes(&header.properties);
                 (FrameType::ContentHeader, *channel, writer.into_inner())
             }
-            Self::ContentBody { channel, body } => {
-                (FrameType::ContentBody, *channel, body.to_vec())
+            Self::ContentBody { .. } => {
+                unreachable!("content body frames are encoded without a copy above")
             }
             Self::Heartbeat { channel } => (FrameType::Heartbeat, *channel, Vec::new()),
         };
@@ -247,7 +271,7 @@ impl Frame {
             max: u32::MAX as usize,
         })?;
 
-        let mut output = Vec::with_capacity(7 + payload.len() + 1);
+        let mut output = Vec::with_capacity(FRAME_OVERHEAD + payload.len());
         output.push(frame_type.as_u8());
         output.extend_from_slice(&channel.to_be_bytes());
         output.extend_from_slice(&size.to_be_bytes());

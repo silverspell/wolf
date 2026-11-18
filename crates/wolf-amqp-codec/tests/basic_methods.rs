@@ -1,8 +1,9 @@
 use bytes::Bytes;
 use wolf_amqp_codec::{
     BasicAck, BasicCancel, BasicCancelOk, BasicConsume, BasicConsumeOk, BasicDeliver, BasicGet,
-    BasicGetEmpty, BasicGetOk, BasicMethod, BasicNack, BasicQos, BasicQosOk, BasicReject, Error,
-    FieldTable, FieldValue, Method, ShortString, basic, basic_ack, basic_consume,
+    BasicGetEmpty, BasicGetOk, BasicMethod, BasicNack, BasicPublish, BasicQos, BasicQosOk,
+    BasicReject, BasicReturn, Error, FieldTable, FieldValue, Method, ShortString, basic, basic_ack,
+    basic_consume, basic_publish,
 };
 
 fn sample_arguments() -> FieldTable {
@@ -86,6 +87,25 @@ fn sample_methods() -> Vec<(BasicMethod, u16)> {
             basic_consume::CANCEL_OK,
         ),
         (
+            BasicMethod::Publish(BasicPublish {
+                ticket: 7,
+                exchange: ShortString::new("events"),
+                routing_key: ShortString::new("jobs"),
+                mandatory: true,
+                immediate: true,
+            }),
+            basic_publish::PUBLISH,
+        ),
+        (
+            BasicMethod::Return(BasicReturn {
+                reply_code: 312,
+                reply_text: ShortString::new("NO_ROUTE"),
+                exchange: ShortString::new("events"),
+                routing_key: ShortString::new("jobs"),
+            }),
+            basic_publish::RETURN,
+        ),
+        (
             BasicMethod::Deliver(BasicDeliver {
                 consumer_tag: ShortString::new("ctag"),
                 delivery_tag,
@@ -162,8 +182,12 @@ fn method_ids_match_amqp_spec() {
             basic_ack::ACK,
             basic_ack::REJECT,
             basic_ack::NACK,
+            basic_publish::PUBLISH,
+            basic_publish::RETURN,
         ],
-        [60, 10, 11, 20, 21, 30, 31, 60, 70, 71, 72, 80, 90, 120]
+        [
+            60, 10, 11, 20, 21, 30, 31, 60, 70, 71, 72, 80, 90, 120, 40, 50
+        ]
     );
 }
 
@@ -249,6 +273,71 @@ fn cancel_ok_encodes_exact_wire_bytes() {
     assert_eq!(
         method.encode(),
         vec![0x00, 0x3C, 0x00, 0x1F, 0x02, b'c', b't']
+    );
+}
+
+#[test]
+fn publish_encodes_exact_wire_bytes() {
+    let method = Method::Basic(BasicMethod::Publish(BasicPublish {
+        ticket: 1,
+        exchange: ShortString::new("ex"),
+        routing_key: ShortString::new("rk"),
+        mandatory: true,
+        immediate: false,
+    }));
+    assert_eq!(
+        method.encode(),
+        vec![
+            0x00, 0x3C, 0x00, 0x28, // class 60, method 40
+            0x00, 0x01, // ticket
+            0x02, b'e', b'x', // exchange
+            0x02, b'r', b'k', // routing key
+            0x01, // mandatory
+        ]
+    );
+}
+
+#[test]
+fn publish_flag_octet_preserves_every_mask() {
+    for mask in 0..=0x03u8 {
+        let publish = BasicPublish {
+            ticket: 1,
+            exchange: ShortString::new("ex"),
+            routing_key: ShortString::new("rk"),
+            mandatory: mask & 0x01 != 0,
+            immediate: mask & 0x02 != 0,
+        };
+        let encoded = Method::Basic(BasicMethod::Publish(publish.clone())).encode();
+        assert_eq!(encoded[12], mask, "packed octet for mask {mask:#04b}");
+
+        let decoded = Method::decode(&Bytes::from(encoded)).unwrap();
+        assert_eq!(decoded, Method::Basic(BasicMethod::Publish(publish)));
+
+        let Method::Basic(BasicMethod::Publish(decoded_publish)) = decoded else {
+            panic!("expected basic.publish");
+        };
+        assert_eq!(decoded_publish.mandatory, mask & 0x01 != 0);
+        assert_eq!(decoded_publish.immediate, mask & 0x02 != 0);
+    }
+}
+
+#[test]
+fn return_encodes_exact_wire_bytes() {
+    let method = Method::Basic(BasicMethod::Return(BasicReturn {
+        reply_code: 312,
+        reply_text: ShortString::new("NO_ROUTE"),
+        exchange: ShortString::new("ex"),
+        routing_key: ShortString::new("rk"),
+    }));
+    assert_eq!(
+        method.encode(),
+        vec![
+            0x00, 0x3C, 0x00, 0x32, // class 60, method 50
+            0x01, 0x38, // reply code 312
+            0x08, b'N', b'O', b'_', b'R', b'O', b'U', b'T', b'E', // reply text
+            0x02, b'e', b'x', // exchange
+            0x02, b'r', b'k', // routing key
+        ]
     );
 }
 
