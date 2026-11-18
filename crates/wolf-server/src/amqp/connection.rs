@@ -6,19 +6,22 @@ use std::sync::Arc;
 
 use wolf_amqp_codec::{
     BasicMethod, BasicPublish, ChannelCloseOk, ChannelFlowOk, ChannelMethod, ChannelOpenOk,
-    CloseOk, ConfirmMethod, ConnectionMethod, ContentHeader, FieldTable, FieldValue, Frame,
-    LongString, Method, OpenOk, ShortString, Start, StartOk, Tune, TuneOk, basic, channel, confirm,
-    connection,
+    CloseOk, ConfirmMethod, ConnectionMethod, ContentHeader, ExchangeMethod, FieldTable,
+    FieldValue, Frame, LongString, Method, OpenOk, QueueMethod, ShortString, Start, StartOk, Tune,
+    TuneOk, basic, channel, confirm, connection, exchange, queue,
 };
 use wolf_broker::{
-    Broker, ConnectionId as BrokerConnectionId, Message, PublishOutcome, PublishRequest, VhostName,
+    Broker, ConnectionId as BrokerConnectionId, Message, PublishOutcome, PublishRequest, Vhost,
+    VhostName,
 };
 
 use crate::amqp::auth::{self, AuthError};
 use crate::amqp::basic_publish::{CompletedPublish, PendingPublish};
 use crate::amqp::channel::Channel;
 use crate::amqp::confirm::ConfirmState;
+use crate::amqp::consumer::ConsumerDirectory;
 use crate::amqp::error::{AmqpError, CloseLevel, ReplyCode};
+use crate::amqp::{exchange as exchange_handler, queue as queue_handler};
 
 /// Default maximum number of channels advertised in `connection.tune`.
 pub const DEFAULT_CHANNEL_MAX: u16 = 2047;
@@ -59,6 +62,7 @@ pub struct Connection {
     frame_max: u32,
     heartbeat: u16,
     vhost: Option<VhostName>,
+    consumers: ConsumerDirectory,
 }
 
 impl Connection {
@@ -84,6 +88,7 @@ impl Connection {
             frame_max: DEFAULT_FRAME_MAX,
             heartbeat: DEFAULT_HEARTBEAT,
             vhost: None,
+            consumers: ConsumerDirectory::new(),
         }
     }
 
@@ -352,12 +357,123 @@ impl Connection {
             Method::Basic(BasicMethod::Publish(publish)) => {
                 self.basic_publish(frame_channel, publish)
             }
+            Method::Exchange(ExchangeMethod::Declare(declare)) => {
+                self.exchange_declare(frame_channel, declare)
+            }
+            Method::Exchange(ExchangeMethod::Delete(delete)) => {
+                self.exchange_delete(frame_channel, delete)
+            }
+            Method::Queue(QueueMethod::Declare(declare)) => {
+                self.queue_declare(frame_channel, declare)
+            }
+            Method::Queue(QueueMethod::Bind(bind)) => self.queue_bind(frame_channel, bind),
+            Method::Queue(QueueMethod::Unbind(unbind)) => self.queue_unbind(frame_channel, unbind),
+            Method::Queue(QueueMethod::Purge(purge)) => self.queue_purge(frame_channel, purge),
+            Method::Queue(QueueMethod::Delete(delete)) => self.queue_delete(frame_channel, delete),
+            Method::Exchange(method) => Err(self.command_invalid(
+                exchange::CLASS_ID,
+                method.method_id(),
+                "client sent a server-only exchange method",
+            )),
+            Method::Queue(method) => Err(self.command_invalid(
+                queue::CLASS_ID,
+                method.method_id(),
+                "client sent a server-only queue method",
+            )),
             method => Err(self.command_invalid(
                 method.class_id(),
                 method.method_id(),
                 "method is not supported",
             )),
         }
+    }
+
+    fn exchange_declare(
+        &mut self,
+        frame_channel: u16,
+        request: wolf_amqp_codec::ExchangeDeclare,
+    ) -> Result<Vec<Frame>, AmqpError> {
+        let vhost = self.resolved_vhost(exchange::CLASS_ID, exchange::DECLARE)?;
+        exchange_handler::declare(vhost, frame_channel, request)
+    }
+
+    fn exchange_delete(
+        &mut self,
+        frame_channel: u16,
+        request: wolf_amqp_codec::ExchangeDelete,
+    ) -> Result<Vec<Frame>, AmqpError> {
+        let vhost = self.resolved_vhost(exchange::CLASS_ID, exchange::DELETE)?;
+        exchange_handler::delete(vhost, frame_channel, request)
+    }
+
+    fn queue_declare(
+        &mut self,
+        frame_channel: u16,
+        request: wolf_amqp_codec::QueueDeclare,
+    ) -> Result<Vec<Frame>, AmqpError> {
+        let vhost = self.resolved_vhost(queue::CLASS_ID, queue::DECLARE)?;
+        queue_handler::declare(vhost, frame_channel, self.broker_connection, request)
+    }
+
+    fn queue_bind(
+        &mut self,
+        frame_channel: u16,
+        request: wolf_amqp_codec::QueueBind,
+    ) -> Result<Vec<Frame>, AmqpError> {
+        let vhost = self.resolved_vhost(queue::CLASS_ID, queue::BIND)?;
+        queue_handler::bind(vhost, frame_channel, self.broker_connection, request)
+    }
+
+    fn queue_unbind(
+        &mut self,
+        frame_channel: u16,
+        request: wolf_amqp_codec::QueueUnbind,
+    ) -> Result<Vec<Frame>, AmqpError> {
+        let vhost = self.resolved_vhost(queue::CLASS_ID, queue::UNBIND)?;
+        queue_handler::unbind(vhost, frame_channel, self.broker_connection, request)
+    }
+
+    fn queue_purge(
+        &mut self,
+        frame_channel: u16,
+        request: wolf_amqp_codec::QueuePurge,
+    ) -> Result<Vec<Frame>, AmqpError> {
+        let vhost = self.resolved_vhost(queue::CLASS_ID, queue::PURGE)?;
+        queue_handler::purge(vhost, frame_channel, self.broker_connection, request)
+    }
+
+    fn queue_delete(
+        &mut self,
+        frame_channel: u16,
+        request: wolf_amqp_codec::QueueDelete,
+    ) -> Result<Vec<Frame>, AmqpError> {
+        let Some(name) = self.vhost.clone() else {
+            return Err(self.command_invalid(
+                queue::CLASS_ID,
+                queue::DELETE,
+                "connection has no open vhost",
+            ));
+        };
+        let broker = self.broker.clone();
+        let vhost = broker.vhost(&name).map_err(|error| {
+            AmqpError::from_domain(&error).with_offending(queue::CLASS_ID, queue::DELETE)
+        })?;
+        queue_handler::delete(
+            vhost,
+            frame_channel,
+            self.broker_connection,
+            request,
+            &mut self.consumers,
+        )
+    }
+
+    fn resolved_vhost(&self, class_id: u16, method_id: u16) -> Result<&Vhost, AmqpError> {
+        let Some(name) = self.vhost.as_ref() else {
+            return Err(self.command_invalid(class_id, method_id, "connection has no open vhost"));
+        };
+        self.broker
+            .vhost(name)
+            .map_err(|error| AmqpError::from_domain(&error).with_offending(class_id, method_id))
     }
 
     fn confirm_select(

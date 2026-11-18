@@ -1,11 +1,15 @@
 //! AMQP protocol adaptation shared by connection sessions.
 
+pub mod arguments;
 pub mod auth;
 pub mod basic_publish;
 pub mod channel;
 pub mod confirm;
 pub mod connection;
+pub mod consumer;
 pub mod error;
+pub mod exchange;
+pub mod queue;
 
 /// Identifier of an AMQP method as a class id and method id pair.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
