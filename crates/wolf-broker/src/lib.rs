@@ -13,6 +13,7 @@ pub mod delivery;
 pub mod error;
 pub mod exchange;
 pub mod message;
+pub mod publish;
 pub mod queue;
 pub mod router;
 pub mod stream;
@@ -33,6 +34,10 @@ pub use exchange::{
     ExchangeRegistry,
 };
 pub use message::Message;
+pub use publish::{
+    AckState, GetMessage, GetOutcome, PublishOutcome, PublishRequest, Returned, get_message,
+    publish,
+};
 pub use queue::{
     ConnectionCloseOutcome, ConnectionId, Queue, QueueConfig, QueueDeleteOutcome, QueueRegistry,
 };
