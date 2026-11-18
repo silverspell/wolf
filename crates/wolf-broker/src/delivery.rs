@@ -4,6 +4,7 @@
 //! wire protocol they speak. `basic.cancel` is represented only as a
 //! [`ConsumerCancel`] with an opaque consumer id and a domain [`CancelReason`].
 
+use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::message::Message;
@@ -97,8 +98,20 @@ pub enum CancelReason {
     Other(String),
 }
 
+/// The result of handing a delivery to a session sink.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliverOutcome {
+    /// The delivery was accepted by the sink.
+    Delivered,
+    /// The sink's route is closed and dispatching should stop.
+    Closed,
+}
+
 /// The broker-to-session sink for deliveries and cancellations.
 pub trait DeliverySink {
-    fn deliver(&mut self, delivery: Delivery);
-    fn cancel(&mut self, cancel: ConsumerCancel);
+    /// Hands one delivery to the sink, awaiting outbox capacity if necessary.
+    fn deliver(&mut self, delivery: Delivery) -> impl Future<Output = DeliverOutcome> + Send;
+
+    /// Hands one server-initiated cancellation to the sink.
+    fn cancel(&mut self, cancel: ConsumerCancel) -> impl Future<Output = ()> + Send;
 }

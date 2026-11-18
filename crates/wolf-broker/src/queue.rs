@@ -95,7 +95,7 @@ pub struct Queue {
 }
 
 impl Queue {
-    fn new(name: QueueName, config: QueueConfig, owner: ConnectionId) -> Self {
+    pub(crate) fn new(name: QueueName, config: QueueConfig, owner: ConnectionId) -> Self {
         Self {
             name,
             config,
@@ -160,7 +160,58 @@ impl Queue {
         self.consumers.iter().map(|entry| entry.consumer)
     }
 
-    fn check_access(&self, connection: ConnectionId) -> Result<(), DomainError> {
+    /// Appends a message to the back of the queue.
+    pub(crate) fn push_message(&mut self, message: Message) {
+        self.messages.push_back(QueuedMessage {
+            message,
+            redelivered: false,
+        });
+    }
+
+    /// Removes the oldest message, returning it and its redelivered flag.
+    pub(crate) fn take_front(&mut self) -> Option<(Message, bool)> {
+        self.messages
+            .pop_front()
+            .map(|entry| (entry.message, entry.redelivered))
+    }
+
+    /// Pushes a message back to the front of the queue.
+    pub(crate) fn push_front(&mut self, message: Message, redelivered: bool) {
+        self.messages.push_front(QueuedMessage {
+            message,
+            redelivered,
+        });
+    }
+
+    /// Adds a consumer, ignoring duplicates.
+    pub(crate) fn add_consumer(&mut self, connection: ConnectionId, consumer: ConsumerId) {
+        if !self
+            .consumers
+            .iter()
+            .any(|entry| entry.consumer == consumer)
+        {
+            self.consumers.push(ConsumerEntry {
+                consumer,
+                connection,
+            });
+        }
+    }
+
+    /// Removes a consumer, returning whether it was registered.
+    pub(crate) fn remove_consumer(&mut self, consumer: ConsumerId) -> bool {
+        let before = self.consumers.len();
+        self.consumers.retain(|entry| entry.consumer != consumer);
+        self.consumers.len() != before
+    }
+
+    /// Removes every stored message, returning how many were discarded.
+    pub(crate) fn clear_messages(&mut self) -> usize {
+        let removed = self.messages.len();
+        self.messages.clear();
+        removed
+    }
+
+    pub(crate) fn check_access(&self, connection: ConnectionId) -> Result<(), DomainError> {
         if self.config.exclusive && self.owner != connection {
             return Err(DomainError::ResourceLocked {
                 message: format!(
@@ -172,7 +223,10 @@ impl Queue {
         Ok(())
     }
 
-    fn remove_consumers_for_connection(&mut self, connection: ConnectionId) -> Vec<ConsumerId> {
+    pub(crate) fn remove_consumers_for_connection(
+        &mut self,
+        connection: ConnectionId,
+    ) -> Vec<ConsumerId> {
         let mut removed = Vec::new();
         self.consumers.retain(|entry| {
             if entry.connection == connection {

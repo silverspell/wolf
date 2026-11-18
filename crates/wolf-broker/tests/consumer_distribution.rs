@@ -1,8 +1,10 @@
+use std::future::Future;
+
 use bytes::Bytes;
 use wolf_broker::queue::{ConnectionId, QueueConfig, QueueRegistry};
 use wolf_broker::{
-    ChannelId, ConsumerCancel, ConsumerDispatcher, ConsumerId, CreditSignal, Delivery,
-    DeliverySink, Message,
+    ChannelId, ConsumerCancel, ConsumerDispatcher, ConsumerId, CreditSignal, DeliverOutcome,
+    Delivery, DeliverySink, Message,
 };
 
 #[derive(Debug, Default)]
@@ -11,11 +13,14 @@ struct RecordingSink {
 }
 
 impl DeliverySink for RecordingSink {
-    fn deliver(&mut self, delivery: Delivery) {
+    fn deliver(&mut self, delivery: Delivery) -> impl Future<Output = DeliverOutcome> + Send {
         self.deliveries.push(delivery);
+        std::future::ready(DeliverOutcome::Delivered)
     }
 
-    fn cancel(&mut self, _cancel: ConsumerCancel) {}
+    fn cancel(&mut self, _cancel: ConsumerCancel) -> impl Future<Output = ()> + Send {
+        std::future::ready(())
+    }
 }
 
 fn message(body: &'static str) -> Message {
@@ -50,8 +55,8 @@ fn setup_two_consumers() -> (
     (queues, dispatcher, connection, channel, first, second)
 }
 
-#[test]
-fn prefetch_one_alternates_and_caps_each_consumer() {
+#[tokio::test]
+async fn prefetch_one_alternates_and_caps_each_consumer() {
     let (mut queues, mut dispatcher, connection, channel, first, second) = setup_two_consumers();
     let signals = dispatcher.set_prefetch(channel, 1, false);
     assert_eq!(signals.len(), 2);
@@ -66,6 +71,7 @@ fn prefetch_one_alternates_and_caps_each_consumer() {
     assert_eq!(
         dispatcher
             .dispatch(&mut queues, "jobs", &mut sink)
+            .await
             .expect("first dispatch"),
         2
     );
@@ -91,6 +97,7 @@ fn prefetch_one_alternates_and_caps_each_consumer() {
     assert_eq!(
         dispatcher
             .dispatch(&mut queues, "jobs", &mut sink)
+            .await
             .expect("second dispatch"),
         1
     );
@@ -108,6 +115,7 @@ fn prefetch_one_alternates_and_caps_each_consumer() {
     assert_eq!(
         dispatcher
             .dispatch(&mut queues, "jobs", &mut sink)
+            .await
             .expect("third dispatch"),
         1
     );
@@ -116,8 +124,8 @@ fn prefetch_one_alternates_and_caps_each_consumer() {
     assert_eq!(queues.queue("jobs").expect("queue").message_count(), 0);
 }
 
-#[test]
-fn prefetch_zero_means_unlimited() {
+#[tokio::test]
+async fn prefetch_zero_means_unlimited() {
     let (mut queues, mut dispatcher, connection, channel, first, second) = setup_two_consumers();
     dispatcher.set_prefetch(channel, 0, false);
 
@@ -131,6 +139,7 @@ fn prefetch_zero_means_unlimited() {
     assert_eq!(
         dispatcher
             .dispatch(&mut queues, "jobs", &mut sink)
+            .await
             .expect("dispatch"),
         4
     );
@@ -145,8 +154,8 @@ fn prefetch_zero_means_unlimited() {
     assert_eq!(dispatcher.unacked_count(channel), 4);
 }
 
-#[test]
-fn credit_signals_are_per_consumer_when_global_false() {
+#[tokio::test]
+async fn credit_signals_are_per_consumer_when_global_false() {
     let (_queues, mut dispatcher, _connection, channel, first, second) = setup_two_consumers();
 
     let signals = dispatcher.set_prefetch(channel, 2, false);
@@ -166,8 +175,8 @@ fn credit_signals_are_per_consumer_when_global_false() {
     );
 }
 
-#[test]
-fn credit_signal_is_channel_scoped_when_global_true() {
+#[tokio::test]
+async fn credit_signal_is_channel_scoped_when_global_true() {
     let (_queues, mut dispatcher, _connection, channel, _first, _second) = setup_two_consumers();
 
     let signals = dispatcher.set_prefetch(channel, 4, true);
@@ -175,8 +184,8 @@ fn credit_signal_is_channel_scoped_when_global_true() {
     assert_eq!(signals, vec![CreditSignal::Channel { channel, credit: 4 }]);
 }
 
-#[test]
-fn global_prefetch_caps_total_inflight_across_consumers() {
+#[tokio::test]
+async fn global_prefetch_caps_total_inflight_across_consumers() {
     let (mut queues, mut dispatcher, connection, channel, first, second) = setup_two_consumers();
     dispatcher.set_prefetch(channel, 2, true);
 
@@ -190,6 +199,7 @@ fn global_prefetch_caps_total_inflight_across_consumers() {
     assert_eq!(
         dispatcher
             .dispatch(&mut queues, "jobs", &mut sink)
+            .await
             .expect("first dispatch"),
         2
     );
@@ -210,6 +220,7 @@ fn global_prefetch_caps_total_inflight_across_consumers() {
     assert_eq!(
         dispatcher
             .dispatch(&mut queues, "jobs", &mut sink)
+            .await
             .expect("second dispatch"),
         1
     );

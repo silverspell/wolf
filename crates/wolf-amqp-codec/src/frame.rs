@@ -1,10 +1,10 @@
 //! AMQP 0-9-1 protocol header and frame encoding/decoding.
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 
 use crate::error::{Error, Result};
 use crate::methods::Method;
-use crate::types::{Reader, Writer};
+use crate::types::Reader;
 
 /// The frame terminator octet.
 pub const FRAME_END: u8 = 0xCE;
@@ -97,6 +97,61 @@ pub struct ContentHeader {
     pub body_size: u64,
     /// Raw property flags and values.
     pub properties: Bytes,
+}
+
+impl ContentHeader {
+    /// Appends the content-header payload to `buffer`.
+    pub fn encode_into(&self, buffer: &mut BytesMut) -> Result<()> {
+        buffer.extend_from_slice(&self.class_id.to_be_bytes());
+        buffer.extend_from_slice(&self.weight.to_be_bytes());
+        buffer.extend_from_slice(&self.body_size.to_be_bytes());
+        buffer.extend_from_slice(&self.properties);
+        Ok(())
+    }
+}
+
+/// The three wire segments of one encoded frame.
+///
+/// The header and tail are fixed-size inline arrays. For content-body frames
+/// the payload is a clone of the source [`Bytes`] and therefore shares its
+/// allocation, so writing a delivery does not copy the message body.
+#[derive(Debug, Clone)]
+pub struct FrameSegments {
+    header: [u8; 7],
+    payload: Bytes,
+    tail: [u8; 1],
+}
+
+impl FrameSegments {
+    /// Returns the seven-byte frame header.
+    pub fn header(&self) -> &[u8; 7] {
+        &self.header
+    }
+
+    /// Returns the frame payload.
+    pub fn payload(&self) -> &Bytes {
+        &self.payload
+    }
+
+    /// Returns the content-body payload when this is a content-body frame.
+    pub fn body(&self) -> Option<&Bytes> {
+        (self.header[0] == FrameType::ContentBody.as_u8()).then_some(&self.payload)
+    }
+
+    /// Returns the frame-end octet.
+    pub fn tail(&self) -> &[u8; 1] {
+        &self.tail
+    }
+
+    /// Returns the total encoded frame length.
+    pub fn len(&self) -> usize {
+        self.header.len() + self.payload.len() + self.tail.len()
+    }
+
+    /// Returns `true` when the frame has no payload (heartbeat frames).
+    pub fn is_empty(&self) -> bool {
+        self.payload.is_empty()
+    }
 }
 
 /// A decoded AMQP frame.
@@ -223,60 +278,77 @@ impl Frame {
 
     /// Encodes the frame, returning an error for values that exceed AMQP limits.
     pub fn try_encode(&self) -> Result<Vec<u8>> {
-        if let Self::ContentBody { channel, body } = self {
-            if body.len() > MAX_FRAME_SIZE {
-                return Err(Error::FrameTooLarge {
-                    size: body.len(),
-                    max: MAX_FRAME_SIZE,
-                });
-            }
-            let size = u32::try_from(body.len()).map_err(|_| Error::FrameTooLarge {
-                size: body.len(),
-                max: u32::MAX as usize,
-            })?;
-
-            let mut output = Vec::with_capacity(FRAME_OVERHEAD + body.len());
-            output.push(FrameType::ContentBody.as_u8());
-            output.extend_from_slice(&channel.to_be_bytes());
-            output.extend_from_slice(&size.to_be_bytes());
-            output.extend_from_slice(body);
-            output.push(FRAME_END);
-            return Ok(output);
-        }
-
-        let (frame_type, channel, payload) = match self {
-            Self::Method { channel, method } => (FrameType::Method, *channel, method.try_encode()?),
-            Self::ContentHeader { channel, header } => {
-                let mut writer = Writer::new();
-                writer.write_u16(header.class_id);
-                writer.write_u16(header.weight);
-                writer.write_u64(header.body_size);
-                writer.write_bytes(&header.properties);
-                (FrameType::ContentHeader, *channel, writer.into_inner())
-            }
-            Self::ContentBody { .. } => {
-                unreachable!("content body frames are encoded without a copy above")
-            }
-            Self::Heartbeat { channel } => (FrameType::Heartbeat, *channel, Vec::new()),
-        };
-
-        if payload.len() > MAX_FRAME_SIZE {
-            return Err(Error::FrameTooLarge {
-                size: payload.len(),
-                max: MAX_FRAME_SIZE,
-            });
-        }
-        let size = u32::try_from(payload.len()).map_err(|_| Error::FrameTooLarge {
-            size: payload.len(),
-            max: u32::MAX as usize,
-        })?;
-
-        let mut output = Vec::with_capacity(FRAME_OVERHEAD + payload.len());
-        output.push(frame_type.as_u8());
-        output.extend_from_slice(&channel.to_be_bytes());
-        output.extend_from_slice(&size.to_be_bytes());
-        output.extend_from_slice(&payload);
-        output.push(FRAME_END);
+        let segments = self.encode_segments()?;
+        let mut output = Vec::with_capacity(segments.len());
+        output.extend_from_slice(segments.header());
+        output.extend_from_slice(segments.payload());
+        output.extend_from_slice(segments.tail());
         Ok(output)
     }
+
+    /// Splits the frame into header, payload and tail wire segments.
+    ///
+    /// Content-body payloads share the source [`Bytes`] allocation instead of
+    /// copying the body.
+    pub fn encode_segments(&self) -> Result<FrameSegments> {
+        let (frame_type, channel, payload) = match self {
+            Self::Method { channel, method } => (
+                FrameType::Method,
+                *channel,
+                Bytes::from(method.try_encode()?),
+            ),
+            Self::ContentHeader { channel, header } => {
+                let mut buffer = BytesMut::with_capacity(16 + header.properties.len());
+                header.encode_into(&mut buffer)?;
+                (FrameType::ContentHeader, *channel, buffer.freeze())
+            }
+            Self::ContentBody { channel, body } => (FrameType::ContentBody, *channel, body.clone()),
+            Self::Heartbeat { channel } => (FrameType::Heartbeat, *channel, Bytes::new()),
+        };
+
+        let header = frame_header(frame_type, channel, payload.len())?;
+        Ok(FrameSegments {
+            header,
+            payload,
+            tail: [FRAME_END],
+        })
+    }
+
+    /// Appends the encoded frame to `buffer`.
+    ///
+    /// The buffer is left unchanged when encoding fails. Content bodies are
+    /// copied here; use [`Frame::encode_segments`] for zero-copy body writes.
+    pub fn encode_into(&self, buffer: &mut BytesMut) -> Result<()> {
+        let start = buffer.len();
+        let result = (|| {
+            let segments = self.encode_segments()?;
+            buffer.extend_from_slice(segments.header());
+            buffer.extend_from_slice(segments.payload());
+            buffer.extend_from_slice(segments.tail());
+            Ok(())
+        })();
+        if result.is_err() {
+            buffer.truncate(start);
+        }
+        result
+    }
+}
+
+fn frame_header(frame_type: FrameType, channel: u16, size: usize) -> Result<[u8; 7]> {
+    if size > MAX_FRAME_SIZE {
+        return Err(Error::FrameTooLarge {
+            size,
+            max: MAX_FRAME_SIZE,
+        });
+    }
+    let size = u32::try_from(size).map_err(|_| Error::FrameTooLarge {
+        size,
+        max: u32::MAX as usize,
+    })?;
+
+    let mut header = [0u8; 7];
+    header[0] = frame_type.as_u8();
+    header[1..3].copy_from_slice(&channel.to_be_bytes());
+    header[3..7].copy_from_slice(&size.to_be_bytes());
+    Ok(header)
 }

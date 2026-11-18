@@ -19,8 +19,8 @@ pub use content::{
 pub use error::{Error, Result};
 pub use field_table::{FieldTable, FieldValue, MAX_TABLE_DEPTH};
 pub use frame::{
-    ContentHeader, FRAME_END, FRAME_OVERHEAD, Frame, FrameType, MAX_FRAME_SIZE, ProtocolHeader,
-    decode_frame,
+    ContentHeader, FRAME_END, FRAME_OVERHEAD, Frame, FrameSegments, FrameType, MAX_FRAME_SIZE,
+    ProtocolHeader, decode_frame,
 };
 pub use methods::basic::{
     BasicAck, BasicCancel, BasicCancelOk, BasicConsume, BasicConsumeOk, BasicDeliver, BasicGet,
@@ -34,7 +34,8 @@ pub use methods::channel::{
 };
 pub use methods::confirm::{ConfirmMethod, ConfirmSelect, ConfirmSelectOk};
 pub use methods::connection::{
-    Close, CloseOk, ConnectionMethod, Open, OpenOk, Start, StartOk, Tune, TuneOk,
+    Blocked, Close, CloseOk, ConnectionMethod, Open, OpenOk, Start, StartOk, Tune, TuneOk,
+    Unblocked,
 };
 pub use methods::exchange::{
     ExchangeDeclare, ExchangeDeclareOk, ExchangeDelete, ExchangeDeleteOk, ExchangeMethod,

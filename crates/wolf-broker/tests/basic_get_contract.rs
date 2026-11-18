@@ -1,9 +1,11 @@
+use std::future::Future;
+
 use bytes::Bytes;
 use wolf_broker::publish::{AckState, GetOutcome, get_message};
 use wolf_broker::queue::{ConnectionId, QueueConfig, QueueRegistry};
 use wolf_broker::{
-    ChannelId, ConsumerCancel, ConsumerDispatcher, ConsumerId, Delivery, DeliverySink, DomainError,
-    Message,
+    ChannelId, ConsumerCancel, ConsumerDispatcher, ConsumerId, DeliverOutcome, Delivery,
+    DeliverySink, DomainError, Message,
 };
 
 #[derive(Debug, Default)]
@@ -12,11 +14,14 @@ struct RecordingSink {
 }
 
 impl DeliverySink for RecordingSink {
-    fn deliver(&mut self, delivery: Delivery) {
+    fn deliver(&mut self, delivery: Delivery) -> impl Future<Output = DeliverOutcome> + Send {
         self.deliveries.push(delivery);
+        std::future::ready(DeliverOutcome::Delivered)
     }
 
-    fn cancel(&mut self, _cancel: ConsumerCancel) {}
+    fn cancel(&mut self, _cancel: ConsumerCancel) -> impl Future<Output = ()> + Send {
+        std::future::ready(())
+    }
 }
 
 fn message(body: &'static str) -> Message {
@@ -29,8 +34,8 @@ fn declare(queues: &mut QueueRegistry, connection: ConnectionId) {
         .expect("declare queue");
 }
 
-#[test]
-fn get_message_returns_message_and_required_ack_state() {
+#[tokio::test]
+async fn get_message_returns_message_and_required_ack_state() {
     let mut queues = QueueRegistry::new();
     let connection = ConnectionId::new(1);
     declare(&mut queues, connection);
@@ -55,8 +60,8 @@ fn get_message_returns_message_and_required_ack_state() {
     assert_eq!(queues.queue("jobs").expect("queue").message_count(), 1);
 }
 
-#[test]
-fn get_message_reports_not_required_when_no_ack_is_true() {
+#[tokio::test]
+async fn get_message_reports_not_required_when_no_ack_is_true() {
     let mut queues = QueueRegistry::new();
     let connection = ConnectionId::new(1);
     declare(&mut queues, connection);
@@ -77,8 +82,8 @@ fn get_message_reports_not_required_when_no_ack_is_true() {
     }
 }
 
-#[test]
-fn get_message_on_empty_queue_is_empty() {
+#[tokio::test]
+async fn get_message_on_empty_queue_is_empty() {
     let mut queues = QueueRegistry::new();
     let connection = ConnectionId::new(1);
     declare(&mut queues, connection);
@@ -89,8 +94,8 @@ fn get_message_on_empty_queue_is_empty() {
     assert_eq!(queues.queue("jobs").expect("queue").message_count(), 0);
 }
 
-#[test]
-fn get_message_preserves_redelivered_flag() {
+#[tokio::test]
+async fn get_message_preserves_redelivered_flag() {
     let mut queues = QueueRegistry::new();
     let mut dispatcher = ConsumerDispatcher::new();
     let connection = ConnectionId::new(1);
@@ -108,6 +113,7 @@ fn get_message_preserves_redelivered_flag() {
     assert_eq!(
         dispatcher
             .dispatch(&mut queues, "jobs", &mut sink)
+            .await
             .expect("dispatch"),
         1
     );
@@ -129,8 +135,8 @@ fn get_message_preserves_redelivered_flag() {
     }
 }
 
-#[test]
-fn get_message_checks_queue_existence_and_exclusive_access() {
+#[tokio::test]
+async fn get_message_checks_queue_existence_and_exclusive_access() {
     let mut queues = QueueRegistry::new();
     let owner = ConnectionId::new(1);
     let intruder = ConnectionId::new(2);

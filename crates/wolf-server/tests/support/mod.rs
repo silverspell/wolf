@@ -110,6 +110,11 @@ impl TestClient {
         .expect("timed out waiting for a frame")
     }
 
+    /// Reads the next frame within `within`, returning `None` on timeout.
+    pub async fn read_frame_within(&mut self, within: Duration) -> Option<Frame> {
+        timeout(within, self.read_frame()).await.ok()
+    }
+
     /// Reads the next method frame, skipping heartbeats.
     pub async fn read_method(&mut self) -> (u16, Method) {
         loop {
@@ -152,6 +157,17 @@ impl TestClient {
 
     /// Sends `connection.start-ok` with the given credentials.
     pub async fn send_start_ok(&mut self, username: &str, password: &str) {
+        self.send_start_ok_with_properties(username, password, FieldTable::new())
+            .await;
+    }
+
+    /// Sends `connection.start-ok` with explicit client properties.
+    pub async fn send_start_ok_with_properties(
+        &mut self,
+        username: &str,
+        password: &str,
+        client_properties: FieldTable,
+    ) {
         let mut response = Vec::new();
         response.push(0);
         response.extend_from_slice(username.as_bytes());
@@ -160,7 +176,7 @@ impl TestClient {
         self.send_method(
             0,
             Method::Connection(ConnectionMethod::StartOk(StartOk {
-                client_properties: FieldTable::new(),
+                client_properties,
                 mechanism: ShortString::new("PLAIN"),
                 response: LongString::from(response),
                 locale: ShortString::new("en_US"),
@@ -214,6 +230,21 @@ impl TestClient {
     /// Completes a full handshake with zero tune-ok values.
     pub async fn handshake(&mut self) -> Tune {
         self.handshake_with(0, 0, 0).await
+    }
+
+    /// Completes a full handshake with explicit client properties.
+    pub async fn handshake_with_client_properties(
+        &mut self,
+        client_properties: FieldTable,
+    ) -> Tune {
+        let _ = self.begin().await;
+        self.send_start_ok_with_properties("guest", "guest", client_properties)
+            .await;
+        let tune = self.read_tune().await;
+        self.send_tune_ok(0, 0, 0).await;
+        self.send_open("/").await;
+        self.read_open_ok().await;
+        tune
     }
 
     /// Completes a full handshake with explicit tune-ok values.

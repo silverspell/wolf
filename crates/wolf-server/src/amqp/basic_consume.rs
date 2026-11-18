@@ -6,7 +6,7 @@
 //! delivered to its consumer's owning connection.
 
 use bytes::Bytes;
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::Sender;
 use wolf_amqp_codec::{
     BasicCancel, BasicCancelOk, BasicConsume, BasicConsumeOk, BasicDeliver, BasicMethod, BasicQos,
     BasicQosOk, ContentHeader, Frame, Method, ShortString, basic, basic_consume,
@@ -21,7 +21,7 @@ use crate::amqp::error::{AmqpError, ReplyCode};
 use crate::delivery::{DeliveryHub, ServerEvent};
 
 /// Handles `basic.qos`.
-pub fn qos(
+pub async fn qos(
     vhost: &Vhost,
     broker_channel: ChannelId,
     hub: &DeliveryHub,
@@ -42,9 +42,10 @@ pub fn qos(
             u32::from(request.prefetch_count),
             request.global,
         )
+        .await
         .map_err(|error| basic_error(&error, basic_consume::QOS))?;
     vhost
-        .dispatch_all(&mut hub.sink())
+        .dispatch_all_detached(hub.sink())
         .map_err(|error| basic_error(&error, basic_consume::QOS))?;
 
     Ok(vec![Frame::Method {
@@ -55,11 +56,11 @@ pub fn qos(
 
 /// Handles `basic.consume`.
 #[allow(clippy::too_many_arguments)]
-pub fn consume(
+pub async fn consume(
     vhost: &Vhost,
     directory: &mut ConsumerDirectory,
     hub: &DeliveryHub,
-    outbox: &UnboundedSender<ServerEvent>,
+    outbox: &Sender<ServerEvent>,
     channel: u16,
     broker_channel: ChannelId,
     connection: ConnectionId,
@@ -104,6 +105,7 @@ pub fn consume(
                 no_ack: request.no_ack,
             },
         )
+        .await
         .map_err(|error| basic_error(&error, basic_consume::CONSUME))?;
     directory.register(consumer, channel, tag.clone());
     hub.register(consumer, outbox.clone());
@@ -118,14 +120,14 @@ pub fn consume(
     };
 
     vhost
-        .dispatch(request.queue.as_str(), &mut hub.sink())
+        .dispatch_detached(request.queue.as_str(), hub.sink())
         .map_err(|error| basic_error(&error, basic_consume::CONSUME))?;
 
     Ok(frames)
 }
 
 /// Handles `basic.cancel`.
-pub fn cancel(
+pub async fn cancel(
     vhost: &Vhost,
     directory: &mut ConsumerDirectory,
     hub: &DeliveryHub,
@@ -136,6 +138,7 @@ pub fn cancel(
         hub.unregister(consumer);
         vhost
             .cancel(consumer)
+            .await
             .map_err(|error| basic_error(&error, basic_consume::CANCEL))?;
     }
 

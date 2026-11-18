@@ -22,13 +22,14 @@ async fn connection_start_advertises_exactly_the_m1_capabilities() {
     let start = client.begin().await;
 
     let capabilities = capabilities(&start);
-    assert_eq!(capabilities.len(), 5, "capabilities: {capabilities:?}");
+    assert_eq!(capabilities.len(), 6, "capabilities: {capabilities:?}");
     for required in [
         "publisher_confirms",
         "basic.nack",
         "consumer_cancel_notify",
         "per_consumer_qos",
         "authentication_failure_close",
+        "connection.blocked",
     ] {
         assert_eq!(
             capabilities.get(required),
@@ -36,7 +37,7 @@ async fn connection_start_advertises_exactly_the_m1_capabilities() {
             "missing advertised capability {required}"
         );
     }
-    for forbidden in ["connection.blocked", "connection.unblocked", "channel.flow"] {
+    for forbidden in ["connection.unblocked", "channel.flow"] {
         assert!(
             !capabilities.contains_key(forbidden),
             "capability {forbidden} must not be advertised"

@@ -1,5 +1,7 @@
 //! AMQP Confirm class (85) methods.
 
+use bytes::BufMut;
+
 use crate::error::{Error, Result};
 use crate::types::{Reader, Writer};
 
@@ -45,13 +47,12 @@ impl ConfirmMethod {
         }
     }
 
-    pub(crate) fn encode_body(&self) -> Result<Vec<u8>> {
-        let mut writer = Writer::new();
+    pub(crate) fn encode_body_into<B: BufMut>(&self, writer: &mut Writer<B>) -> Result<()> {
         match self {
             Self::Select(method) => writer.write_u8(u8::from(method.nowait)),
             Self::SelectOk(_) => {}
         }
-        Ok(writer.into_inner())
+        Ok(())
     }
 
     pub(crate) fn decode(method_id: u16, reader: &mut Reader<'_>) -> Result<Self> {

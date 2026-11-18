@@ -1,5 +1,7 @@
 //! AMQP connection class (class id 10) methods.
 
+use bytes::BufMut;
+
 use crate::error::{Error, Result};
 use crate::types::{FieldTable, LongString, Reader, ShortString, Writer};
 
@@ -22,6 +24,10 @@ pub const OPEN_OK: u16 = 41;
 pub const CLOSE: u16 = 50;
 /// `connection.close-ok` method id.
 pub const CLOSE_OK: u16 = 51;
+/// `connection.blocked` method id.
+pub const BLOCKED: u16 = 60;
+/// `connection.unblocked` method id.
+pub const UNBLOCKED: u16 = 61;
 
 /// `connection.start` — server greeting.
 #[derive(Debug, Clone, PartialEq)]
@@ -108,6 +114,17 @@ pub struct Close {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CloseOk;
 
+/// `connection.blocked` — the server has raised a resource alarm.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Blocked {
+    /// Human-readable reason for the block, such as `low on memory`.
+    pub reason: ShortString,
+}
+
+/// `connection.unblocked` — the server's resource alarm has cleared.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unblocked;
+
 /// A method from the AMQP connection class.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConnectionMethod {
@@ -127,6 +144,10 @@ pub enum ConnectionMethod {
     Close(Close),
     /// `connection.close-ok`
     CloseOk(CloseOk),
+    /// `connection.blocked`
+    Blocked(Blocked),
+    /// `connection.unblocked`
+    Unblocked(Unblocked),
 }
 
 impl ConnectionMethod {
@@ -146,11 +167,12 @@ impl ConnectionMethod {
             Self::OpenOk(_) => OPEN_OK,
             Self::Close(_) => CLOSE,
             Self::CloseOk(_) => CLOSE_OK,
+            Self::Blocked(_) => BLOCKED,
+            Self::Unblocked(_) => UNBLOCKED,
         }
     }
 
-    pub(crate) fn encode_body(&self) -> Result<Vec<u8>> {
-        let mut writer = Writer::new();
+    pub(crate) fn encode_body_into<B: BufMut>(&self, writer: &mut Writer<B>) -> Result<()> {
         match self {
             Self::Start(method) => {
                 writer.write_u8(method.version_major);
@@ -166,13 +188,13 @@ impl ConnectionMethod {
                 writer.write_short_string(method.locale.as_str())?;
             }
             Self::Tune(method) => encode_tune(
-                &mut writer,
+                writer,
                 method.channel_max,
                 method.frame_max,
                 method.heartbeat,
             ),
             Self::TuneOk(method) => encode_tune(
-                &mut writer,
+                writer,
                 method.channel_max,
                 method.frame_max,
                 method.heartbeat,
@@ -192,8 +214,12 @@ impl ConnectionMethod {
                 writer.write_u16(method.method_id);
             }
             Self::CloseOk(_) => {}
+            Self::Blocked(method) => {
+                writer.write_short_string(method.reason.as_str())?;
+            }
+            Self::Unblocked(_) => {}
         }
-        Ok(writer.into_inner())
+        Ok(())
     }
 
     pub(crate) fn decode(method_id: u16, reader: &mut Reader<'_>) -> Result<Self> {
@@ -242,6 +268,10 @@ impl ConnectionMethod {
                 method_id: reader.read_u16()?,
             }),
             CLOSE_OK => Self::CloseOk(CloseOk),
+            BLOCKED => Self::Blocked(Blocked {
+                reason: reader.read_short_string()?,
+            }),
+            UNBLOCKED => Self::Unblocked(Unblocked),
             other => {
                 return Err(Error::UnknownMethod {
                     class_id: CLASS_ID,
@@ -253,7 +283,12 @@ impl ConnectionMethod {
     }
 }
 
-fn encode_tune(writer: &mut Writer, channel_max: u16, frame_max: u32, heartbeat: u16) {
+fn encode_tune<B: BufMut>(
+    writer: &mut Writer<B>,
+    channel_max: u16,
+    frame_max: u32,
+    heartbeat: u16,
+) {
     writer.write_u16(channel_max);
     writer.write_u32(frame_max);
     writer.write_u16(heartbeat);

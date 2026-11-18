@@ -1,5 +1,7 @@
 //! AMQP Channel class (20) methods.
 
+use bytes::BufMut;
+
 use crate::error::{Error, Result};
 use crate::methods::{bit_set, pack_bits};
 use crate::types::{LongString, Reader, ShortString, Writer};
@@ -100,8 +102,7 @@ impl ChannelMethod {
         }
     }
 
-    pub(crate) fn encode_body(&self) -> Result<Vec<u8>> {
-        let mut writer = Writer::new();
+    pub(crate) fn encode_body_into<B: BufMut>(&self, writer: &mut Writer<B>) -> Result<()> {
         match self {
             Self::Open(method) => {
                 writer.write_short_string(method.out_of_band.as_str())?;
@@ -123,7 +124,7 @@ impl ChannelMethod {
             }
             Self::CloseOk(_) => {}
         }
-        Ok(writer.into_inner())
+        Ok(())
     }
 
     pub(crate) fn decode(method_id: u16, reader: &mut Reader<'_>) -> Result<Self> {

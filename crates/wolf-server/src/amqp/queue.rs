@@ -13,14 +13,16 @@ use crate::amqp::error::AmqpError;
 use crate::delivery::DeliveryHub;
 
 /// Handles `queue.declare`.
-pub fn declare(
+pub async fn declare(
     vhost: &Vhost,
     channel: u16,
     connection: ConnectionId,
     request: QueueDeclare,
 ) -> Result<Vec<Frame>, AmqpError> {
     let result = if request.passive {
-        vhost.declare_queue_passive(request.queue.as_str(), connection)
+        vhost
+            .declare_queue_passive(request.queue.as_str(), connection)
+            .await
     } else {
         let arguments = arguments::convert(&request.arguments)
             .map_err(|error| queue_error(&error, queue::DECLARE))?;
@@ -30,7 +32,9 @@ pub fn declare(
             auto_delete: request.auto_delete,
             arguments,
         };
-        vhost.declare_queue(request.queue.as_str(), config, connection)
+        vhost
+            .declare_queue(request.queue.as_str(), config, connection)
+            .await
     };
     let declaration = result.map_err(|error| queue_error(&error, queue::DECLARE))?;
 
@@ -48,7 +52,7 @@ pub fn declare(
 }
 
 /// Handles `queue.bind`.
-pub fn bind(
+pub async fn bind(
     vhost: &Vhost,
     channel: u16,
     connection: ConnectionId,
@@ -61,6 +65,7 @@ pub fn bind(
             request.routing_key.as_str(),
             connection,
         )
+        .await
         .map_err(|error| queue_error(&error, queue::BIND))?;
 
     if request.nowait {
@@ -73,7 +78,7 @@ pub fn bind(
 }
 
 /// Handles `queue.unbind`.
-pub fn unbind(
+pub async fn unbind(
     vhost: &Vhost,
     channel: u16,
     connection: ConnectionId,
@@ -86,6 +91,7 @@ pub fn unbind(
             request.routing_key.as_str(),
             connection,
         )
+        .await
         .map_err(|error| queue_error(&error, queue::UNBIND))?;
 
     Ok(vec![Frame::Method {
@@ -95,7 +101,7 @@ pub fn unbind(
 }
 
 /// Handles `queue.purge`.
-pub fn purge(
+pub async fn purge(
     vhost: &Vhost,
     channel: u16,
     connection: ConnectionId,
@@ -103,6 +109,7 @@ pub fn purge(
 ) -> Result<Vec<Frame>, AmqpError> {
     let message_count = vhost
         .purge_queue(request.queue.as_str(), connection)
+        .await
         .map_err(|error| queue_error(&error, queue::PURGE))?;
 
     if request.nowait {
@@ -120,7 +127,7 @@ pub fn purge(
 /// [`ConsumerDirectory`] and emitted as server-initiated `basic.cancel` frames
 /// before the `queue.delete-ok` reply. Consumers without a registered wire tag
 /// are ignored because no `basic.consume` handler exists yet.
-pub fn delete(
+pub async fn delete(
     vhost: &Vhost,
     channel: u16,
     connection: ConnectionId,
@@ -128,7 +135,7 @@ pub fn delete(
     consumers: &mut ConsumerDirectory,
 ) -> Result<Vec<Frame>, AmqpError> {
     let hub = DeliveryHub::new();
-    delete_with_hub(vhost, channel, connection, request, consumers, &hub)
+    delete_with_hub(vhost, channel, connection, request, consumers, &hub).await
 }
 
 /// Handles `queue.delete`, routing cross-connection cancels through the hub.
@@ -137,7 +144,7 @@ pub fn delete(
 /// `queue.delete-ok` reply. Consumers owned by other connections receive the
 /// cancellation through the delivery hub. Consumers without a registered wire
 /// tag are ignored.
-pub fn delete_with_hub(
+pub async fn delete_with_hub(
     vhost: &Vhost,
     channel: u16,
     connection: ConnectionId,
@@ -152,12 +159,13 @@ pub fn delete_with_hub(
             request.if_unused,
             request.if_empty,
         )
+        .await
         .map_err(|error| queue_error(&error, queue::DELETE))?;
 
     let mut frames = Vec::new();
     for cancel in outcome.cancels {
         let Some(entry) = consumers.remove(cancel.consumer) else {
-            hub.cancel(cancel);
+            hub.cancel(cancel).await;
             continue;
         };
         hub.unregister(cancel.consumer);
@@ -232,8 +240,8 @@ mod tests {
         (*channel, &cancel.consumer_tag)
     }
 
-    #[test]
-    fn delete_emits_cancel_before_delete_ok_for_registered_consumers() {
+    #[tokio::test]
+    async fn delete_emits_cancel_before_delete_ok_for_registered_consumers() {
         let consumer = ConsumerId::new(7);
         let vhost = vhost_with_consumer("busy", consumer);
         let mut consumers = ConsumerDirectory::new();
@@ -246,6 +254,7 @@ mod tests {
             delete_request("busy", false),
             &mut consumers,
         )
+        .await
         .expect("delete succeeds");
 
         assert_eq!(frames.len(), 2);
@@ -262,8 +271,8 @@ mod tests {
         assert!(consumers.is_empty());
     }
 
-    #[test]
-    fn delete_of_an_unregistered_consumer_emits_only_delete_ok() {
+    #[tokio::test]
+    async fn delete_of_an_unregistered_consumer_emits_only_delete_ok() {
         let consumer = ConsumerId::new(8);
         let vhost = vhost_with_consumer("busy", consumer);
         let mut consumers = ConsumerDirectory::new();
@@ -275,6 +284,7 @@ mod tests {
             delete_request("busy", false),
             &mut consumers,
         )
+        .await
         .expect("delete succeeds");
 
         assert_eq!(frames.len(), 1);
@@ -287,8 +297,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn if_unused_delete_with_a_consumer_closes_the_channel_with_406() {
+    #[tokio::test]
+    async fn if_unused_delete_with_a_consumer_closes_the_channel_with_406() {
         let consumer = ConsumerId::new(9);
         let vhost = vhost_with_consumer("busy", consumer);
         let mut consumers = ConsumerDirectory::new();
@@ -299,6 +309,7 @@ mod tests {
             ..delete_request("busy", false)
         };
         let error = delete(&vhost, 1, ConnectionId::new(1), request, &mut consumers)
+            .await
             .expect_err("consumer blocks if_unused");
 
         assert_eq!(error.reply_code.code(), 406);
@@ -306,8 +317,8 @@ mod tests {
         assert_eq!(consumers.len(), 1);
     }
 
-    #[test]
-    fn nowait_delete_emits_cancels_but_no_delete_ok() {
+    #[tokio::test]
+    async fn nowait_delete_emits_cancels_but_no_delete_ok() {
         let consumer = ConsumerId::new(10);
         let vhost = vhost_with_consumer("busy", consumer);
         let mut consumers = ConsumerDirectory::new();
@@ -320,6 +331,7 @@ mod tests {
             delete_request("busy", true),
             &mut consumers,
         )
+        .await
         .expect("delete succeeds");
 
         assert_eq!(frames.len(), 1);
@@ -328,8 +340,8 @@ mod tests {
         assert_eq!(tag.as_str(), "tag-10");
     }
 
-    #[test]
-    fn declare_passes_through_the_domain_arguments() {
+    #[tokio::test]
+    async fn declare_passes_through_the_domain_arguments() {
         let vhost = Vhost::new(VhostId::new(1), VhostName::new("/").expect("valid vhost"));
 
         let frames = declare(
@@ -347,6 +359,7 @@ mod tests {
                 arguments: FieldTable::new(),
             },
         )
+        .await
         .expect("declare succeeds");
 
         assert!(matches!(

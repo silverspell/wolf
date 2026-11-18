@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::Sender;
 use wolf_amqp_codec::Frame;
 use wolf_broker::{Broker, ConnectionId as BrokerConnectionId};
 
@@ -96,7 +96,7 @@ impl Session {
         broker: Arc<Broker>,
         account: Arc<Account>,
         hub: Arc<DeliveryHub>,
-        outbox: UnboundedSender<ServerEvent>,
+        outbox: Sender<ServerEvent>,
     ) -> Self {
         Self {
             id,
@@ -122,13 +122,26 @@ impl Session {
     }
 
     /// Dispatches one decoded client frame to the connection state machine.
-    pub fn dispatch(&mut self, frame: Frame) -> Result<Vec<Frame>, AmqpError> {
-        self.connection.handle_frame(frame)
+    pub async fn dispatch(&mut self, frame: Frame) -> Result<Vec<Frame>, AmqpError> {
+        self.connection.handle_frame(frame).await
     }
 
     /// Returns the negotiated heartbeat interval.
     pub fn heartbeat_interval(&self) -> Duration {
         Duration::from_secs(u64::from(self.connection.heartbeat()))
+    }
+
+    /// Applies a memory-alarm transition to the connection.
+    pub async fn set_memory_alarm(
+        &mut self,
+        active: bool,
+    ) -> Result<Vec<wolf_amqp_codec::Frame>, AmqpError> {
+        self.connection.set_memory_alarm(active).await
+    }
+
+    /// Returns whether socket reads must pause for a deferred publish.
+    pub const fn read_paused(&self) -> bool {
+        self.connection.read_paused()
     }
 
     /// Returns whether the connection has closed.
@@ -142,8 +155,8 @@ impl Session {
     }
 
     /// Releases consumers and requeues unacknowledged deliveries on exit.
-    pub fn shutdown(&mut self) {
-        self.connection.cleanup_connection();
+    pub async fn shutdown(&mut self) {
+        self.connection.cleanup_connection().await;
     }
 
     /// Returns the underlying connection state.
@@ -172,8 +185,8 @@ mod tests {
         Arc::new(Broker::new())
     }
 
-    #[test]
-    fn session_delegates_start_and_start_ok_to_the_connection() {
+    #[tokio::test]
+    async fn session_delegates_start_and_start_ok_to_the_connection() {
         let peer = "127.0.0.1:1234".parse().expect("valid address");
         let mut session = Session::new(
             ConnectionId::new(7),
@@ -195,14 +208,15 @@ mod tests {
                     locale: ShortString::new("en_US"),
                 })),
             })
+            .await
             .expect("start-ok is accepted");
         assert_eq!(frames.len(), 1);
         assert_eq!(method_id(&frames[0]), connection::TUNE);
         assert!(!session.is_closed());
     }
 
-    #[test]
-    fn heartbeats_keep_the_session_open() {
+    #[tokio::test]
+    async fn heartbeats_keep_the_session_open() {
         let peer = "127.0.0.1:1234".parse().expect("valid address");
         let mut session = Session::new(
             ConnectionId::new(8),
@@ -213,6 +227,7 @@ mod tests {
 
         let frames = session
             .dispatch(Frame::Heartbeat { channel: 0 })
+            .await
             .expect("heartbeat is accepted");
         assert!(frames.is_empty());
         assert!(!session.is_closed());

@@ -25,8 +25,8 @@ pub use binding::{Binding, QueueName};
 pub use broker::Broker;
 pub use consumer::{ConsumerDispatcher, ConsumerOptions, SettleOutcome};
 pub use delivery::{
-    CancelReason, ChannelId, ConsumerCancel, ConsumerId, CreditReceiver, CreditSignal, Delivery,
-    DeliverySink, DeliveryTag,
+    CancelReason, ChannelId, ConsumerCancel, ConsumerId, CreditReceiver, CreditSignal,
+    DeliverOutcome, Delivery, DeliverySink, DeliveryTag,
 };
 pub use error::{DomainError, ResourceKind};
 pub use exchange::{
@@ -43,4 +43,6 @@ pub use queue::{
 };
 pub use topic::{RoutingKey, TopicPattern, TopicTrie};
 pub use validation::{QueueArguments, UNSUPPORTED_QUEUE_ARGUMENTS, validate_queue_arguments};
-pub use vhost::{QueueDeclaration, Vhost, VhostId, VhostName};
+pub use vhost::{
+    DEFAULT_QUEUE_CHANNEL_CAPACITY, QueueDeclaration, Vhost, VhostConfig, VhostId, VhostName,
+};
