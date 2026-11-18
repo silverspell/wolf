@@ -24,6 +24,10 @@ pub const OPEN_OK: u16 = 41;
 pub const CLOSE: u16 = 50;
 /// `connection.close-ok` method id.
 pub const CLOSE_OK: u16 = 51;
+/// `connection.blocked` method id.
+pub const BLOCKED: u16 = 60;
+/// `connection.unblocked` method id.
+pub const UNBLOCKED: u16 = 61;
 
 /// `connection.start` — server greeting.
 #[derive(Debug, Clone, PartialEq)]
@@ -110,6 +114,17 @@ pub struct Close {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CloseOk;
 
+/// `connection.blocked` — the server has raised a resource alarm.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Blocked {
+    /// Human-readable reason for the block, such as `low on memory`.
+    pub reason: ShortString,
+}
+
+/// `connection.unblocked` — the server's resource alarm has cleared.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unblocked;
+
 /// A method from the AMQP connection class.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConnectionMethod {
@@ -129,6 +144,10 @@ pub enum ConnectionMethod {
     Close(Close),
     /// `connection.close-ok`
     CloseOk(CloseOk),
+    /// `connection.blocked`
+    Blocked(Blocked),
+    /// `connection.unblocked`
+    Unblocked(Unblocked),
 }
 
 impl ConnectionMethod {
@@ -148,6 +167,8 @@ impl ConnectionMethod {
             Self::OpenOk(_) => OPEN_OK,
             Self::Close(_) => CLOSE,
             Self::CloseOk(_) => CLOSE_OK,
+            Self::Blocked(_) => BLOCKED,
+            Self::Unblocked(_) => UNBLOCKED,
         }
     }
 
@@ -193,6 +214,10 @@ impl ConnectionMethod {
                 writer.write_u16(method.method_id);
             }
             Self::CloseOk(_) => {}
+            Self::Blocked(method) => {
+                writer.write_short_string(method.reason.as_str())?;
+            }
+            Self::Unblocked(_) => {}
         }
         Ok(())
     }
@@ -243,6 +268,10 @@ impl ConnectionMethod {
                 method_id: reader.read_u16()?,
             }),
             CLOSE_OK => Self::CloseOk(CloseOk),
+            BLOCKED => Self::Blocked(Blocked {
+                reason: reader.read_short_string()?,
+            }),
+            UNBLOCKED => Self::Unblocked(Unblocked),
             other => {
                 return Err(Error::UnknownMethod {
                     class_id: CLASS_ID,

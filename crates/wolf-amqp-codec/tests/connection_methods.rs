@@ -1,7 +1,7 @@
 use bytes::Bytes;
 use wolf_amqp_codec::{
-    Close, CloseOk, ConnectionMethod, FieldTable, FieldValue, LongString, Method, Open, OpenOk,
-    ShortString, Start, StartOk, Tune, TuneOk, connection,
+    Blocked, Close, CloseOk, ConnectionMethod, FieldTable, FieldValue, LongString, Method, Open,
+    OpenOk, ShortString, Start, StartOk, Tune, TuneOk, Unblocked, connection,
 };
 
 fn sample_methods() -> Vec<(ConnectionMethod, u16)> {
@@ -78,6 +78,16 @@ fn sample_methods() -> Vec<(ConnectionMethod, u16)> {
             connection::CLOSE,
         ),
         (ConnectionMethod::CloseOk(CloseOk), connection::CLOSE_OK),
+        (
+            ConnectionMethod::Blocked(Blocked {
+                reason: ShortString::new("low on memory"),
+            }),
+            connection::BLOCKED,
+        ),
+        (
+            ConnectionMethod::Unblocked(Unblocked),
+            connection::UNBLOCKED,
+        ),
     ]
 }
 
@@ -91,6 +101,8 @@ fn variant_name(method: &ConnectionMethod) -> &'static str {
         ConnectionMethod::OpenOk(_) => "open-ok",
         ConnectionMethod::Close(_) => "close",
         ConnectionMethod::CloseOk(_) => "close-ok",
+        ConnectionMethod::Blocked(_) => "blocked",
+        ConnectionMethod::Unblocked(_) => "unblocked",
     }
 }
 
@@ -107,8 +119,10 @@ fn method_ids_match_amqp_spec() {
             connection::OPEN_OK,
             connection::CLOSE,
             connection::CLOSE_OK,
+            connection::BLOCKED,
+            connection::UNBLOCKED,
         ),
-        (10, 10, 11, 30, 31, 40, 41, 50, 51)
+        (10, 10, 11, 30, 31, 40, 41, 50, 51, 60, 61)
     );
 }
 
@@ -137,4 +151,23 @@ fn dispatch_selects_the_right_variant() {
         };
         assert_eq!(variant_name(&decoded_method), variant_name(&method));
     }
+}
+
+#[test]
+fn connection_blocked_methods_roundtrip() {
+    let blocked = ConnectionMethod::Blocked(Blocked {
+        reason: ShortString::new("low on memory"),
+    });
+    let encoded = Method::from(blocked.clone()).encode();
+    let decoded = Method::decode(&Bytes::from(encoded.clone())).expect("blocked decodes");
+    assert_eq!(decoded, Method::from(blocked));
+    assert_eq!(decoded.method_id(), connection::BLOCKED);
+    assert_eq!(decoded.class_id(), connection::CLASS_ID);
+
+    let unblocked = ConnectionMethod::Unblocked(Unblocked);
+    let encoded = Method::from(unblocked.clone()).encode();
+    let decoded = Method::decode(&Bytes::from(encoded.clone())).expect("unblocked decodes");
+    assert_eq!(decoded, Method::from(unblocked));
+    assert_eq!(decoded.method_id(), connection::UNBLOCKED);
+    assert_eq!(decoded.class_id(), connection::CLASS_ID);
 }

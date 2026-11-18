@@ -27,6 +27,8 @@ pub const DEFAULT_MEMORY_HIGH_WATERMARK_RELATIVE: f64 = 0.4;
 pub const DEFAULT_MEMORY_CHECK_INTERVAL_MS: u64 = 1000;
 /// Default capacity of each connection's bounded outbox.
 pub const DEFAULT_OUTBOX_CAPACITY: usize = crate::delivery::DEFAULT_OUTBOX_CAPACITY;
+/// Default capacity of each queue task's bounded command channel.
+pub const DEFAULT_QUEUE_CHANNEL_CAPACITY: usize = wolf_broker::DEFAULT_QUEUE_CHANNEL_CAPACITY;
 
 /// Configuration used to start a Wolf server.
 #[derive(Debug, Clone, PartialEq)]
@@ -45,6 +47,8 @@ pub struct ServerConfig {
     pub memory_check_interval: Duration,
     /// Capacity of each connection's bounded delivery outbox.
     pub outbox_capacity: usize,
+    /// Capacity of each queue task's bounded command channel.
+    pub queue_channel_capacity: usize,
 }
 
 impl ServerConfig {
@@ -102,6 +106,7 @@ impl Default for ServerConfig {
             ),
             memory_check_interval: Duration::from_millis(DEFAULT_MEMORY_CHECK_INTERVAL_MS),
             outbox_capacity: DEFAULT_OUTBOX_CAPACITY,
+            queue_channel_capacity: DEFAULT_QUEUE_CHANNEL_CAPACITY,
         }
     }
 }

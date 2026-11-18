@@ -34,7 +34,8 @@ pub use methods::channel::{
 };
 pub use methods::confirm::{ConfirmMethod, ConfirmSelect, ConfirmSelectOk};
 pub use methods::connection::{
-    Close, CloseOk, ConnectionMethod, Open, OpenOk, Start, StartOk, Tune, TuneOk,
+    Blocked, Close, CloseOk, ConnectionMethod, Open, OpenOk, Start, StartOk, Tune, TuneOk,
+    Unblocked,
 };
 pub use methods::exchange::{
     ExchangeDeclare, ExchangeDeclareOk, ExchangeDelete, ExchangeDeleteOk, ExchangeMethod,

@@ -131,6 +131,19 @@ impl Session {
         Duration::from_secs(u64::from(self.connection.heartbeat()))
     }
 
+    /// Applies a memory-alarm transition to the connection.
+    pub async fn set_memory_alarm(
+        &mut self,
+        active: bool,
+    ) -> Result<Vec<wolf_amqp_codec::Frame>, AmqpError> {
+        self.connection.set_memory_alarm(active).await
+    }
+
+    /// Returns whether socket reads must pause for a deferred publish.
+    pub const fn read_paused(&self) -> bool {
+        self.connection.read_paused()
+    }
+
     /// Returns whether the connection has closed.
     pub const fn is_closed(&self) -> bool {
         self.connection.is_closed()
