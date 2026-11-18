@@ -1,0 +1,20 @@
+[package]
+name = "wolf-server"
+description = "Wolf broker binary: config, listeners, protocol sessions, metrics and health."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "wolf"
+path = "src/main.rs"
+
+[dependencies]
+wolf-amqp-codec.workspace = true
+wolf-stream-codec.workspace = true
+wolf-storage.workspace = true
+wolf-broker.workspace = true
+
+[lints]
+workspace = true
