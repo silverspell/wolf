@@ -5,15 +5,20 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use wolf_amqp_codec::{
-    ChannelCloseOk, ChannelFlowOk, ChannelMethod, ChannelOpenOk, CloseOk, ConnectionMethod,
-    FieldTable, FieldValue, Frame, LongString, Method, OpenOk, ShortString, Start, StartOk, Tune,
-    TuneOk, channel, connection,
+    BasicMethod, BasicPublish, ChannelCloseOk, ChannelFlowOk, ChannelMethod, ChannelOpenOk,
+    CloseOk, ConfirmMethod, ConnectionMethod, ContentHeader, FieldTable, FieldValue, Frame,
+    LongString, Method, OpenOk, ShortString, Start, StartOk, Tune, TuneOk, basic, channel, confirm,
+    connection,
 };
-use wolf_broker::{Broker, VhostName};
+use wolf_broker::{
+    Broker, ConnectionId as BrokerConnectionId, Message, PublishOutcome, PublishRequest, VhostName,
+};
 
 use crate::amqp::auth::{self, AuthError};
+use crate::amqp::basic_publish::{CompletedPublish, PendingPublish};
 use crate::amqp::channel::Channel;
-use crate::amqp::error::{AmqpError, ReplyCode};
+use crate::amqp::confirm::ConfirmState;
+use crate::amqp::error::{AmqpError, CloseLevel, ReplyCode};
 
 /// Default maximum number of channels advertised in `connection.tune`.
 pub const DEFAULT_CHANNEL_MAX: u16 = 2047;
@@ -48,6 +53,7 @@ pub struct Connection {
     state: State,
     peer: SocketAddr,
     broker: Arc<Broker>,
+    broker_connection: BrokerConnectionId,
     channels: BTreeMap<u16, Channel>,
     channel_max: u16,
     frame_max: u32,
@@ -58,10 +64,21 @@ pub struct Connection {
 impl Connection {
     /// Creates a connection in the initial handshake state.
     pub fn new(peer: SocketAddr, broker: Arc<Broker>) -> Self {
+        Self::with_connection_id(peer, broker, BrokerConnectionId::new(0))
+    }
+
+    /// Creates a connection with the broker-side connection identifier used
+    /// for exclusive-queue ownership and publish access checks.
+    pub fn with_connection_id(
+        peer: SocketAddr,
+        broker: Arc<Broker>,
+        broker_connection: BrokerConnectionId,
+    ) -> Self {
         Self {
             state: State::AwaitingStartOk,
             peer,
             broker,
+            broker_connection,
             channels: BTreeMap::new(),
             channel_max: DEFAULT_CHANNEL_MAX,
             frame_max: DEFAULT_FRAME_MAX,
@@ -134,11 +151,14 @@ impl Connection {
         match frame {
             Frame::Heartbeat { .. } => Ok(Vec::new()),
             Frame::Method { channel, method } => self.handle_method(channel, method),
-            Frame::ContentHeader { .. } | Frame::ContentBody { .. } => Err(self.command_invalid(
-                0,
-                0,
-                "content frames are not valid during connection setup",
-            )),
+            Frame::ContentHeader { channel, header } => {
+                let result = self.handle_content_header(channel, header);
+                self.finish_channel_result(channel, result)
+            }
+            Frame::ContentBody { channel, body } => {
+                let result = self.handle_content_body(channel, body);
+                self.finish_channel_result(channel, result)
+            }
         }
     }
 
@@ -173,7 +193,25 @@ impl Connection {
             ));
         }
 
-        self.handle_channel_method(frame_channel, method)
+        let result = self.handle_channel_method(frame_channel, method);
+        self.finish_channel_result(frame_channel, result)
+    }
+
+    fn finish_channel_result(
+        &mut self,
+        frame_channel: u16,
+        result: Result<Vec<Frame>, AmqpError>,
+    ) -> Result<Vec<Frame>, AmqpError> {
+        match result {
+            Ok(frames) => Ok(frames),
+            Err(error) if error.close_level == CloseLevel::Channel => {
+                if let Some(channel) = self.channels.get_mut(&frame_channel) {
+                    channel.begin_close();
+                }
+                Ok(vec![error.to_frame(frame_channel)])
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn handle_connection_method(&mut self, method: Method) -> Result<Vec<Frame>, AmqpError> {
@@ -283,22 +321,186 @@ impl Connection {
             ));
         }
 
-        let Method::Channel(method) = method else {
-            return Err(self.command_invalid(0, 0, "expected a channel method"));
-        };
-
-        match method {
-            ChannelMethod::Open(_) => self.open_channel(frame_channel),
-            ChannelMethod::Close(_) => self.close_channel(frame_channel),
-            ChannelMethod::Flow(flow) => self.channel_flow(frame_channel, flow.active),
-            ChannelMethod::OpenOk(_) | ChannelMethod::FlowOk(_) | ChannelMethod::CloseOk(_) => {
-                Err(self.command_invalid(
-                    channel::CLASS_ID,
-                    method.method_id(),
-                    "client sent a server-only channel method",
-                ))
+        if let Some(channel) = self.channels.get(&frame_channel) {
+            if channel.is_closing() {
+                if matches!(method, Method::Channel(ChannelMethod::CloseOk(_))) {
+                    self.channels.remove(&frame_channel);
+                }
+                return Ok(Vec::new());
             }
         }
+
+        match method {
+            Method::Channel(ChannelMethod::Open(_)) => self.open_channel(frame_channel),
+            Method::Channel(ChannelMethod::Close(_)) => self.close_channel(frame_channel),
+            Method::Channel(ChannelMethod::Flow(flow)) => {
+                self.channel_flow(frame_channel, flow.active)
+            }
+            Method::Channel(method) => Err(self.command_invalid(
+                channel::CLASS_ID,
+                method.method_id(),
+                "client sent a server-only channel method",
+            )),
+            Method::Confirm(ConfirmMethod::Select(select)) => {
+                self.confirm_select(frame_channel, select)
+            }
+            Method::Confirm(ConfirmMethod::SelectOk(_)) => Err(self.command_invalid(
+                confirm::CLASS_ID,
+                confirm::SELECT_OK,
+                "client sent a server-only confirm method",
+            )),
+            Method::Basic(BasicMethod::Publish(publish)) => {
+                self.basic_publish(frame_channel, publish)
+            }
+            method => Err(self.command_invalid(
+                method.class_id(),
+                method.method_id(),
+                "method is not supported",
+            )),
+        }
+    }
+
+    fn confirm_select(
+        &mut self,
+        frame_channel: u16,
+        select: wolf_amqp_codec::ConfirmSelect,
+    ) -> Result<Vec<Frame>, AmqpError> {
+        let Some(channel) = self.channels.get_mut(&frame_channel) else {
+            return Err(self.command_invalid(
+                confirm::CLASS_ID,
+                confirm::SELECT,
+                "channel is not open",
+            ));
+        };
+        Ok(channel
+            .confirm
+            .select(frame_channel, select.nowait)
+            .into_iter()
+            .collect())
+    }
+
+    fn basic_publish(
+        &mut self,
+        frame_channel: u16,
+        publish: BasicPublish,
+    ) -> Result<Vec<Frame>, AmqpError> {
+        let Some(channel) = self.channels.get_mut(&frame_channel) else {
+            return Err(self.command_invalid(
+                basic::CLASS_ID,
+                basic::PUBLISH,
+                "channel is not open",
+            ));
+        };
+        if channel.is_closing() {
+            return Ok(Vec::new());
+        }
+        if channel.pending_publish.is_some() {
+            return Err(unexpected_frame(
+                "basic.publish arrived before the previous content finished",
+            ));
+        }
+        channel.pending_publish = Some(PendingPublish::begin(publish)?);
+        Ok(Vec::new())
+    }
+
+    fn handle_content_header(
+        &mut self,
+        frame_channel: u16,
+        header: ContentHeader,
+    ) -> Result<Vec<Frame>, AmqpError> {
+        if self.state != State::Open {
+            return Err(self.command_invalid(0, 0, "content frames require an open connection"));
+        }
+
+        let completed = {
+            let Some(channel) = self.channels.get_mut(&frame_channel) else {
+                return Err(unexpected_frame("content header on an unopened channel"));
+            };
+            if channel.is_closing() {
+                return Ok(Vec::new());
+            }
+            let Some(mut pending) = channel.pending_publish.take() else {
+                return Err(unexpected_frame("content header without basic.publish"));
+            };
+            let completed = pending.accept_header(header)?;
+            if completed.is_none() {
+                channel.pending_publish = Some(pending);
+            }
+            completed
+        };
+
+        match completed {
+            Some(completed) => self.complete_publish(frame_channel, completed),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    fn handle_content_body(
+        &mut self,
+        frame_channel: u16,
+        body: bytes::Bytes,
+    ) -> Result<Vec<Frame>, AmqpError> {
+        if self.state != State::Open {
+            return Err(self.command_invalid(0, 0, "content frames require an open connection"));
+        }
+
+        let completed = {
+            let Some(channel) = self.channels.get_mut(&frame_channel) else {
+                return Err(unexpected_frame("content body on an unopened channel"));
+            };
+            if channel.is_closing() {
+                return Ok(Vec::new());
+            }
+            let Some(pending) = channel.pending_publish.as_mut() else {
+                return Err(unexpected_frame("content body without a content header"));
+            };
+            pending.accept_body(body)?
+        };
+
+        match completed {
+            Some(completed) => self.complete_publish(frame_channel, completed),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    fn complete_publish(
+        &mut self,
+        frame_channel: u16,
+        completed: CompletedPublish,
+    ) -> Result<Vec<Frame>, AmqpError> {
+        let Some(vhost) = self.vhost.clone() else {
+            return Err(self.command_invalid(0, 0, "connection has no open vhost"));
+        };
+        let request = PublishRequest {
+            exchange: completed.method().exchange.as_str(),
+            routing_key: completed.method().routing_key.as_str(),
+            mandatory: completed.method().mandatory,
+            message: Message::new(completed.body().clone()),
+            properties: completed.properties().clone(),
+        };
+
+        let outcome = self
+            .broker
+            .publish(&vhost, self.broker_connection, request)
+            .map_err(|error| {
+                AmqpError::from_domain(&error).with_offending(basic::CLASS_ID, basic::PUBLISH)
+            })?;
+
+        let mut frames = match outcome {
+            PublishOutcome::Returned(_) => {
+                completed.return_frames(frame_channel, self.frame_max)?
+            }
+            PublishOutcome::Routed { .. } | PublishOutcome::Dropped => Vec::new(),
+        };
+
+        if let Some(channel) = self.channels.get_mut(&frame_channel) {
+            channel.pending_publish = None;
+            if let Some(sequence) = channel.confirm.next_publish_sequence() {
+                frames.push(ConfirmState::ack_frame(frame_channel, sequence));
+            }
+        }
+
+        Ok(frames)
     }
 
     fn open_channel(&mut self, frame_channel: u16) -> Result<Vec<Frame>, AmqpError> {
@@ -365,6 +567,10 @@ impl Connection {
     fn command_invalid(&self, class_id: u16, method_id: u16, text: impl Into<String>) -> AmqpError {
         AmqpError::connection(ReplyCode::CommandInvalid, text).with_offending(class_id, method_id)
     }
+}
+
+fn unexpected_frame(text: impl Into<String>) -> AmqpError {
+    AmqpError::connection(ReplyCode::UnexpectedFrame, text)
 }
 
 fn negotiate_limit_u16(server: u16, client: u16) -> u16 {

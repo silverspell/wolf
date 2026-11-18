@@ -3,12 +3,13 @@
 use std::collections::BTreeMap;
 
 use crate::error::DomainError;
+use crate::publish::{PublishOutcome, PublishRequest};
+use crate::queue::ConnectionId;
 use crate::vhost::{Vhost, VhostName};
 
 /// The broker domain root.
 ///
-/// At this stage it only tracks virtual hosts; exchanges, bindings, queues and
-/// routing arrive in later tickets.
+/// Each virtual host owns its exchanges, bindings, queues and routing state.
 #[derive(Debug, Default)]
 pub struct Broker {
     vhosts: BTreeMap<VhostName, Vhost>,
@@ -37,6 +38,16 @@ impl Broker {
             .ok_or_else(|| DomainError::VhostNotFound {
                 vhost: name.as_str().to_string(),
             })
+    }
+
+    /// Publishes a message through the named virtual host.
+    pub fn publish<P>(
+        &self,
+        vhost: &VhostName,
+        connection: ConnectionId,
+        request: PublishRequest<'_, P>,
+    ) -> Result<PublishOutcome<P>, DomainError> {
+        self.vhost(vhost)?.publish(connection, request)
     }
 
     /// Verifies the virtual host and then reports that the queue is unknown.

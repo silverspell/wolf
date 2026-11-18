@@ -1,9 +1,13 @@
 //! Virtual hosts and their identifiers.
 
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
+use crate::binding::QueueName;
 use crate::error::DomainError;
+use crate::publish::{PublishOutcome, PublishRequest, publish};
+use crate::queue::{ConnectionId, QueueRegistry};
+use crate::router::Router;
 
 /// A validated virtual host name.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -45,16 +49,43 @@ impl VhostId {
     }
 }
 
-/// A virtual host skeleton: identity plus name.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Protocol-neutral routing state owned by one virtual host.
+#[derive(Debug)]
+struct VhostState {
+    router: Router,
+    queues: QueueRegistry,
+    destinations: Vec<QueueName>,
+}
+
+/// A virtual host: identity, name and its routing/queue state.
+#[derive(Debug)]
 pub struct Vhost {
     id: VhostId,
     name: VhostName,
+    state: Mutex<VhostState>,
 }
 
 impl Vhost {
     pub fn new(id: VhostId, name: VhostName) -> Self {
-        Self { id, name }
+        Self::with_routing(id, name, Router::default(), QueueRegistry::new())
+    }
+
+    /// Creates a virtual host with caller-supplied routing state.
+    pub fn with_routing(
+        id: VhostId,
+        name: VhostName,
+        router: Router,
+        queues: QueueRegistry,
+    ) -> Self {
+        Self {
+            id,
+            name,
+            state: Mutex::new(VhostState {
+                router,
+                queues,
+                destinations: Vec::new(),
+            }),
+        }
     }
 
     pub fn id(&self) -> VhostId {
@@ -63,5 +94,30 @@ impl Vhost {
 
     pub fn name(&self) -> &VhostName {
         &self.name
+    }
+
+    /// Publishes a message using this virtual host's routing state.
+    pub fn publish<P>(
+        &self,
+        connection: ConnectionId,
+        request: PublishRequest<'_, P>,
+    ) -> Result<PublishOutcome<P>, DomainError> {
+        let mut state = self.state.lock().map_err(|_| DomainError::BrokerClosed)?;
+        let VhostState {
+            router,
+            queues,
+            destinations,
+        } = &mut *state;
+        publish(router, queues, destinations, connection, request)
+    }
+
+    /// Returns the number of messages currently stored in `queue`.
+    pub fn queue_message_count(&self, queue: impl AsRef<str>) -> usize {
+        let queue = queue.as_ref();
+        self.state
+            .lock()
+            .ok()
+            .and_then(|state| state.queues.queue(queue).map(|queue| queue.message_count()))
+            .unwrap_or(0)
     }
 }
