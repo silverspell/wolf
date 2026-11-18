@@ -7,7 +7,7 @@ use std::task::{Context, Poll};
 
 use bytes::Bytes;
 use tokio::io::AsyncWrite;
-use tokio::sync::mpsc::unbounded_channel;
+use tokio::sync::mpsc::channel;
 use wolf_amqp_codec::{CloseOk, ConnectionMethod, ContentHeader, Frame, Method};
 use wolf_broker::{ConsumerId, Delivery, DeliveryTag, Message};
 use wolf_server::delivery::ServerEvent;
@@ -114,9 +114,15 @@ async fn single_write_per_delivery() {
 
 #[tokio::test]
 async fn drain_batches_pending_deliveries() {
-    let (sender, mut outbox) = unbounded_channel();
-    sender.send(delivery_event(1)).expect("first event queues");
-    sender.send(delivery_event(2)).expect("second event queues");
+    let (sender, mut outbox) = channel(2);
+    sender
+        .send(delivery_event(1))
+        .await
+        .expect("first event queues");
+    sender
+        .send(delivery_event(2))
+        .await
+        .expect("second event queues");
     let first = outbox.recv().await.expect("first event");
     let mut writer = CountingWriter::new();
 

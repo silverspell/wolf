@@ -6,7 +6,7 @@
 //! delivered to its consumer's owning connection.
 
 use bytes::Bytes;
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::Sender;
 use wolf_amqp_codec::{
     BasicCancel, BasicCancelOk, BasicConsume, BasicConsumeOk, BasicDeliver, BasicMethod, BasicQos,
     BasicQosOk, ContentHeader, Frame, Method, ShortString, basic, basic_consume,
@@ -45,8 +45,7 @@ pub async fn qos(
         .await
         .map_err(|error| basic_error(&error, basic_consume::QOS))?;
     vhost
-        .dispatch_all(hub.sink())
-        .await
+        .dispatch_all_detached(hub.sink())
         .map_err(|error| basic_error(&error, basic_consume::QOS))?;
 
     Ok(vec![Frame::Method {
@@ -61,7 +60,7 @@ pub async fn consume(
     vhost: &Vhost,
     directory: &mut ConsumerDirectory,
     hub: &DeliveryHub,
-    outbox: &UnboundedSender<ServerEvent>,
+    outbox: &Sender<ServerEvent>,
     channel: u16,
     broker_channel: ChannelId,
     connection: ConnectionId,
@@ -121,8 +120,7 @@ pub async fn consume(
     };
 
     vhost
-        .dispatch(request.queue.as_str(), hub.sink())
-        .await
+        .dispatch_detached(request.queue.as_str(), hub.sink())
         .map_err(|error| basic_error(&error, basic_consume::CONSUME))?;
 
     Ok(frames)

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::Sender;
 use wolf_amqp_codec::Frame;
 use wolf_broker::{Broker, ConnectionId as BrokerConnectionId};
 
@@ -96,7 +96,7 @@ impl Session {
         broker: Arc<Broker>,
         account: Arc<Account>,
         hub: Arc<DeliveryHub>,
-        outbox: UnboundedSender<ServerEvent>,
+        outbox: Sender<ServerEvent>,
     ) -> Self {
         Self {
             id,

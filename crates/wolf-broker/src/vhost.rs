@@ -2,6 +2,8 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -11,7 +13,8 @@ use tokio::task::JoinHandle;
 use crate::binding::QueueName;
 use crate::consumer::{ConsumerDispatcher, ConsumerOptions, SettleOutcome};
 use crate::delivery::{
-    CancelReason, ChannelId, ConsumerCancel, ConsumerId, CreditSignal, DeliverySink, DeliveryTag,
+    CancelReason, ChannelId, ConsumerCancel, ConsumerId, CreditSignal, DeliverOutcome,
+    DeliverySink, DeliveryTag,
 };
 use crate::error::DomainError;
 use crate::exchange::ExchangeConfig;
@@ -65,6 +68,9 @@ impl VhostId {
 
 type Dispatcher = Arc<Mutex<ConsumerDispatcher>>;
 
+/// A dispatch future owned by a queue task.
+type DispatchFuture = Pin<Box<dyn Future<Output = Result<usize, DomainError>> + Send + 'static>>;
+
 /// The default capacity of the bounded channel feeding each queue task.
 pub const DEFAULT_QUEUE_CHANNEL_CAPACITY: usize = 64;
 
@@ -104,8 +110,11 @@ enum QueueCommand {
         reply: oneshot::Sender<Result<(), DomainError>>,
     },
     Deliver {
-        sink: Box<dyn DeliverySink + Send>,
+        future: DispatchFuture,
         reply: oneshot::Sender<Result<usize, DomainError>>,
+    },
+    DeliverDetached {
+        future: DispatchFuture,
     },
 }
 
@@ -142,17 +151,12 @@ impl QueueSlot {
         else {
             return;
         };
-        *task = Some(spawn_queue_task(
-            Arc::clone(&self.queue),
-            Arc::clone(&self.dispatcher),
-            receiver,
-        ));
+        *task = Some(spawn_queue_task(Arc::clone(&self.queue), receiver));
     }
 }
 
 fn spawn_queue_task(
     queue: Arc<Mutex<Queue>>,
-    dispatcher: Dispatcher,
     mut receiver: mpsc::Receiver<QueueCommand>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -166,9 +170,11 @@ fn spawn_queue_task(
                     let result = enqueue_message(&queue, connection, message);
                     let _ = reply.send(result);
                 }
-                QueueCommand::Deliver { sink, reply } => {
-                    let result = deliver_ready(&queue, &dispatcher, sink);
-                    let _ = reply.send(result);
+                QueueCommand::Deliver { future, reply } => {
+                    let _ = reply.send(future.await);
+                }
+                QueueCommand::DeliverDetached { future } => {
+                    let _ = future.await;
                 }
             }
         }
@@ -186,10 +192,18 @@ fn enqueue_message(
     Ok(())
 }
 
-fn deliver_ready(
+fn dispatch_future<S: DeliverySink + Send + 'static>(
+    queue: Arc<Mutex<Queue>>,
+    dispatcher: Dispatcher,
+    sink: S,
+) -> DispatchFuture {
+    Box::pin(async move { deliver_ready(&queue, &dispatcher, sink).await })
+}
+
+async fn deliver_ready<S: DeliverySink>(
     queue: &Mutex<Queue>,
     dispatcher: &Mutex<ConsumerDispatcher>,
-    mut sink: Box<dyn DeliverySink + Send>,
+    mut sink: S,
 ) -> Result<usize, DomainError> {
     let mut delivered = 0;
     loop {
@@ -201,7 +215,9 @@ fn deliver_ready(
         let Some(delivery) = next else {
             break;
         };
-        sink.deliver(delivery);
+        if sink.deliver(delivery).await == DeliverOutcome::Closed {
+            break;
+        }
         delivered += 1;
     }
     Ok(delivered)
@@ -523,12 +539,10 @@ impl Vhost {
     {
         let slot = self.slot(queue.as_ref())?;
         slot.ensure_task();
+        let future = dispatch_future(Arc::clone(&slot.queue), Arc::clone(&slot.dispatcher), sink);
         let (reply, response) = oneshot::channel();
         slot.sender
-            .send(QueueCommand::Deliver {
-                sink: Box::new(sink),
-                reply,
-            })
+            .send(QueueCommand::Deliver { future, reply })
             .await
             .map_err(|_| DomainError::BrokerClosed)?;
         response.await.map_err(|_| DomainError::BrokerClosed)?
@@ -548,12 +562,14 @@ impl Vhost {
         for name in names {
             let slot = self.slot(name.as_str())?;
             slot.ensure_task();
+            let future = dispatch_future(
+                Arc::clone(&slot.queue),
+                Arc::clone(&slot.dispatcher),
+                sink.clone(),
+            );
             let (reply, response) = oneshot::channel();
             slot.sender
-                .send(QueueCommand::Deliver {
-                    sink: Box::new(sink.clone()),
-                    reply,
-                })
+                .send(QueueCommand::Deliver { future, reply })
                 .await
                 .map_err(|_| DomainError::BrokerClosed)?;
             pending.push(response);
@@ -564,6 +580,64 @@ impl Vhost {
             delivered += response.await.map_err(|_| DomainError::BrokerClosed)??;
         }
         Ok(delivered)
+    }
+
+    /// Queues a dispatch for one queue without waiting for its completion.
+    ///
+    /// When the queue command channel is full, a task is spawned to wait for
+    /// capacity so the caller's reader loop never blocks on its own outbox.
+    pub fn dispatch_detached<S>(&self, queue: impl AsRef<str>, sink: S) -> Result<(), DomainError>
+    where
+        S: DeliverySink + Send + 'static,
+    {
+        let slot = self.slot(queue.as_ref())?;
+        slot.ensure_task();
+        let future = dispatch_future(Arc::clone(&slot.queue), Arc::clone(&slot.dispatcher), sink);
+        let command = QueueCommand::DeliverDetached { future };
+        match slot.sender.try_send(command) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(command)) => {
+                let sender = slot.sender.clone();
+                tokio::spawn(async move {
+                    let _ = sender.send(command).await;
+                });
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {}
+        }
+        Ok(())
+    }
+
+    /// Queues a dispatch for every queue without waiting for completion.
+    pub fn dispatch_all_detached<S>(&self, sink: S) -> Result<(), DomainError>
+    where
+        S: DeliverySink + Send + Clone + 'static,
+    {
+        let names: Vec<QueueName> = {
+            let queues = self.queues.lock().map_err(|_| DomainError::BrokerClosed)?;
+            queues.keys().cloned().collect()
+        };
+
+        for name in names {
+            let slot = self.slot(name.as_str())?;
+            slot.ensure_task();
+            let future = dispatch_future(
+                Arc::clone(&slot.queue),
+                Arc::clone(&slot.dispatcher),
+                sink.clone(),
+            );
+            let command = QueueCommand::DeliverDetached { future };
+            match slot.sender.try_send(command) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(command)) => {
+                    let sender = slot.sender.clone();
+                    tokio::spawn(async move {
+                        let _ = sender.send(command).await;
+                    });
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {}
+            }
+        }
+        Ok(())
     }
 
     /// Requeues unacknowledged deliveries on a closing channel and removes its

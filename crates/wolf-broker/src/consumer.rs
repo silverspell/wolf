@@ -8,7 +8,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::binding::QueueName;
-use crate::delivery::{ChannelId, ConsumerId, CreditSignal, Delivery, DeliverySink, DeliveryTag};
+use crate::delivery::{
+    ChannelId, ConsumerId, CreditSignal, DeliverOutcome, Delivery, DeliverySink, DeliveryTag,
+};
 use crate::error::DomainError;
 use crate::message::Message;
 use crate::publish::{GetOutcome, get_message};
@@ -213,12 +215,14 @@ impl ConsumerDispatcher {
 
     /// Delivers ready messages to consumers with available credit.
     ///
-    /// Returns the number of messages delivered in this call.
-    pub fn dispatch(
+    /// Yields to the sink between deliveries and stops once the sink reports
+    /// [`DeliverOutcome::Closed`]. Returns the number of messages delivered in
+    /// this call.
+    pub async fn dispatch<S: DeliverySink>(
         &mut self,
         queues: &mut QueueRegistry,
         queue: impl AsRef<str>,
-        sink: &mut dyn DeliverySink,
+        sink: &mut S,
     ) -> Result<usize, DomainError> {
         let name = queue.as_ref();
         let mut delivered = 0;
@@ -240,12 +244,17 @@ impl ConsumerDispatcher {
                 break;
             };
             let delivery_tag = self.record_delivery(consumer, message.clone());
-            sink.deliver(Delivery {
-                consumer,
-                delivery_tag,
-                message,
-                redelivered,
-            });
+            let outcome = sink
+                .deliver(Delivery {
+                    consumer,
+                    delivery_tag,
+                    message,
+                    redelivered,
+                })
+                .await;
+            if outcome == DeliverOutcome::Closed {
+                break;
+            }
             delivered += 1;
         }
 

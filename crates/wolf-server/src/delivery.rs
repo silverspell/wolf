@@ -1,16 +1,20 @@
 //! Cross-connection routing of broker deliveries and cancellations.
 //!
-//! A [`DeliveryHub`] maps each broker [`ConsumerId`] to the outbox channel of
-//! the connection that owns it. The broker dispatcher writes through the hub as
-//! a [`DeliverySink`], so a queue consumed on one connection can receive
-//! messages published on another without either connection knowing about the
-//! other. Routes whose receivers have gone away are dropped.
+//! A [`DeliveryHub`] maps each broker [`ConsumerId`] to the bounded outbox
+//! channel of the connection that owns it. The broker dispatcher writes through
+//! the hub as a [`DeliverySink`], so a queue consumed on one connection can
+//! receive messages published on another without either connection knowing about
+//! the other. Routes whose receivers have gone away are dropped.
 
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::sync::{Arc, Mutex};
 
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
-use wolf_broker::{ConsumerCancel, ConsumerId, Delivery, DeliverySink};
+use tokio::sync::mpsc::{self, Receiver, Sender};
+use wolf_broker::{ConsumerCancel, ConsumerId, DeliverOutcome, Delivery, DeliverySink};
+
+/// The default capacity of each connection's bounded outbox.
+pub const DEFAULT_OUTBOX_CAPACITY: usize = 256;
 
 /// An event sent from the broker dispatch path to a connection's outbox.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,24 +26,42 @@ pub enum ServerEvent {
 }
 
 /// Routes deliveries and cancellations to their owning connection outboxes.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct DeliveryHub {
-    routes: Arc<Mutex<BTreeMap<ConsumerId, UnboundedSender<ServerEvent>>>>,
+    routes: Arc<Mutex<BTreeMap<ConsumerId, Sender<ServerEvent>>>>,
+    capacity: usize,
+}
+
+impl Default for DeliveryHub {
+    fn default() -> Self {
+        Self::with_capacity(DEFAULT_OUTBOX_CAPACITY)
+    }
 }
 
 impl DeliveryHub {
-    /// Creates an empty routing hub.
+    /// Creates an empty routing hub using the default outbox capacity.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Creates an empty routing hub with an explicit outbox capacity.
+    ///
+    /// A capacity of zero is clamped to one so every connection can always
+    /// accept at least one pending event.
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            routes: Arc::new(Mutex::new(BTreeMap::new())),
+            capacity: capacity.max(1),
+        }
+    }
+
     /// Creates one connection outbox sender/receiver pair.
-    pub fn subscribe(&self) -> (UnboundedSender<ServerEvent>, UnboundedReceiver<ServerEvent>) {
-        unbounded_channel()
+    pub fn subscribe(&self) -> (Sender<ServerEvent>, Receiver<ServerEvent>) {
+        mpsc::channel(self.capacity)
     }
 
     /// Registers the outbox that owns a consumer.
-    pub fn register(&self, consumer: ConsumerId, sender: UnboundedSender<ServerEvent>) {
+    pub fn register(&self, consumer: ConsumerId, sender: Sender<ServerEvent>) {
         if let Ok(mut routes) = self.routes.lock() {
             routes.insert(consumer, sender);
         }
@@ -53,15 +75,15 @@ impl DeliveryHub {
     }
 
     /// Sends a delivery to its registered consumer, dropping stale routes.
-    pub fn deliver(&self, delivery: Delivery) {
+    pub async fn deliver(&self, delivery: Delivery) -> DeliverOutcome {
         let consumer = delivery.consumer;
-        self.send(consumer, ServerEvent::Delivery(delivery));
+        self.send(consumer, ServerEvent::Delivery(delivery)).await
     }
 
     /// Sends a cancellation to its registered consumer, dropping stale routes.
-    pub fn cancel(&self, cancel: ConsumerCancel) {
+    pub async fn cancel(&self, cancel: ConsumerCancel) {
         let consumer = cancel.consumer;
-        self.send(consumer, ServerEvent::Cancel(cancel));
+        let _ = self.send(consumer, ServerEvent::Cancel(cancel)).await;
     }
 
     /// Returns the number of live consumer routes.
@@ -74,26 +96,40 @@ impl DeliveryHub {
         DeliveryHubSink { hub: self.clone() }
     }
 
-    fn send(&self, consumer: ConsumerId, event: ServerEvent) {
-        let Ok(mut routes) = self.routes.lock() else {
-            return;
+    async fn send(&self, consumer: ConsumerId, event: ServerEvent) -> DeliverOutcome {
+        let sender = {
+            let Ok(routes) = self.routes.lock() else {
+                return DeliverOutcome::Closed;
+            };
+            routes.get(&consumer).cloned()
         };
-        let Some(sender) = routes.get(&consumer) else {
-            return;
+        let Some(sender) = sender else {
+            return DeliverOutcome::Closed;
         };
-        if sender.send(event).is_err() {
-            routes.remove(&consumer);
+
+        if sender.send(event).await.is_ok() {
+            return DeliverOutcome::Delivered;
         }
+
+        if let Ok(mut routes) = self.routes.lock() {
+            if routes
+                .get(&consumer)
+                .is_some_and(|current| current.same_channel(&sender))
+            {
+                routes.remove(&consumer);
+            }
+        }
+        DeliverOutcome::Closed
     }
 }
 
 impl DeliverySink for DeliveryHub {
-    fn deliver(&mut self, delivery: Delivery) {
-        DeliveryHub::deliver(self, delivery);
+    fn deliver(&mut self, delivery: Delivery) -> impl Future<Output = DeliverOutcome> + Send {
+        DeliveryHub::deliver(self, delivery)
     }
 
-    fn cancel(&mut self, cancel: ConsumerCancel) {
-        DeliveryHub::cancel(self, cancel);
+    fn cancel(&mut self, cancel: ConsumerCancel) -> impl Future<Output = ()> + Send {
+        DeliveryHub::cancel(self, cancel)
     }
 }
 
@@ -104,12 +140,12 @@ pub struct DeliveryHubSink {
 }
 
 impl DeliverySink for DeliveryHubSink {
-    fn deliver(&mut self, delivery: Delivery) {
-        self.hub.deliver(delivery);
+    fn deliver(&mut self, delivery: Delivery) -> impl Future<Output = DeliverOutcome> + Send {
+        self.hub.deliver(delivery)
     }
 
-    fn cancel(&mut self, cancel: ConsumerCancel) {
-        self.hub.cancel(cancel);
+    fn cancel(&mut self, cancel: ConsumerCancel) -> impl Future<Output = ()> + Send {
+        self.hub.cancel(cancel)
     }
 }
 
@@ -129,14 +165,15 @@ mod tests {
         }
     }
 
-    #[test]
-    fn deliveries_route_to_the_owning_connection() {
+    #[tokio::test]
+    async fn deliveries_route_to_the_owning_connection() {
         let hub = DeliveryHub::new();
         let (sender, mut receiver) = hub.subscribe();
         hub.register(ConsumerId::new(7), sender);
 
-        hub.deliver(delivery(ConsumerId::new(7)));
+        let outcome = hub.deliver(delivery(ConsumerId::new(7))).await;
 
+        assert_eq!(outcome, DeliverOutcome::Delivered);
         assert_eq!(
             receiver.try_recv().expect("delivery"),
             ServerEvent::Delivery(delivery(ConsumerId::new(7)))
@@ -144,8 +181,8 @@ mod tests {
         assert_eq!(hub.route_count(), 1);
     }
 
-    #[test]
-    fn cancellations_route_to_the_owning_connection() {
+    #[tokio::test]
+    async fn cancellations_route_to_the_owning_connection() {
         let hub = DeliveryHub::new();
         let (sender, mut receiver) = hub.subscribe();
         hub.register(ConsumerId::new(8), sender);
@@ -154,7 +191,7 @@ mod tests {
             reason: CancelReason::QueueDeleted,
         };
 
-        hub.cancel(cancel.clone());
+        hub.cancel(cancel.clone()).await;
 
         assert_eq!(
             receiver.try_recv().expect("cancel"),
@@ -162,53 +199,78 @@ mod tests {
         );
     }
 
-    #[test]
-    fn unknown_consumers_are_ignored() {
+    #[tokio::test]
+    async fn unknown_consumers_are_ignored() {
         let hub = DeliveryHub::new();
-        hub.deliver(delivery(ConsumerId::new(99)));
+        let outcome = hub.deliver(delivery(ConsumerId::new(99))).await;
+        assert_eq!(outcome, DeliverOutcome::Closed);
         assert_eq!(hub.route_count(), 0);
     }
 
-    #[test]
-    fn dropping_the_receiver_removes_the_route() {
+    #[tokio::test]
+    async fn dropping_the_receiver_removes_the_route() {
         let hub = DeliveryHub::new();
         let (sender, receiver) = hub.subscribe();
         let consumer = ConsumerId::new(9);
         hub.register(consumer, sender);
         drop(receiver);
 
-        hub.deliver(delivery(consumer));
+        let outcome = hub.deliver(delivery(consumer)).await;
 
+        assert_eq!(outcome, DeliverOutcome::Closed);
         assert_eq!(hub.route_count(), 0);
     }
 
-    #[test]
-    fn unregister_removes_a_live_route() {
+    #[tokio::test]
+    async fn unregister_removes_a_live_route() {
         let hub = DeliveryHub::new();
         let (sender, mut receiver) = hub.subscribe();
         let consumer = ConsumerId::new(10);
         hub.register(consumer, sender);
         hub.unregister(consumer);
 
-        hub.deliver(delivery(consumer));
+        let outcome = hub.deliver(delivery(consumer)).await;
 
+        assert_eq!(outcome, DeliverOutcome::Closed);
         assert!(receiver.try_recv().is_err());
         assert_eq!(hub.route_count(), 0);
     }
 
-    #[test]
-    fn sink_adapter_routes_events() {
+    #[tokio::test]
+    async fn sink_adapter_routes_events() {
         let hub = DeliveryHub::new();
         let (sender, mut receiver) = hub.subscribe();
         let consumer = ConsumerId::new(11);
         hub.register(consumer, sender);
         let mut sink = hub.sink();
 
-        sink.deliver(delivery(consumer));
+        let outcome = sink.deliver(delivery(consumer)).await;
 
+        assert_eq!(outcome, DeliverOutcome::Delivered);
         assert!(matches!(
             receiver.try_recv().expect("delivery"),
             ServerEvent::Delivery(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn deliveries_fill_the_bounded_outbox() {
+        let hub = DeliveryHub::with_capacity(1);
+        let (sender, receiver) = hub.subscribe();
+        let consumer = ConsumerId::new(12);
+        hub.register(consumer, sender);
+
+        assert_eq!(
+            hub.deliver(delivery(consumer)).await,
+            DeliverOutcome::Delivered
+        );
+        assert_eq!(receiver.len(), 1);
+    }
+
+    #[test]
+    fn zero_capacity_is_clamped_to_one() {
+        let hub = DeliveryHub::with_capacity(0);
+        let (_sender, receiver) = hub.subscribe();
+        assert_eq!(receiver.max_capacity(), 1);
     }
 }

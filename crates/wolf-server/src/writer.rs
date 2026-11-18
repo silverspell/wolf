@@ -9,7 +9,7 @@ use std::io::IoSlice;
 
 use bytes::BytesMut;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
-use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::Receiver;
 use tokio::sync::mpsc::error::TryRecvError;
 use wolf_amqp_codec::{Frame, FrameSegments};
 
@@ -82,7 +82,7 @@ pub async fn write_frames<W: AsyncWrite + Unpin>(
 pub async fn drain_outbox<W, F>(
     writer: &mut W,
     first: ServerEvent,
-    outbox: &mut UnboundedReceiver<ServerEvent>,
+    outbox: &mut Receiver<ServerEvent>,
     mut render: F,
 ) -> DrainOutcome
 where

@@ -29,8 +29,7 @@ pub async fn ack(
         .await
         .map_err(|error| basic_error(&error, basic_ack::ACK))?;
     vhost
-        .dispatch_all(hub.sink())
-        .await
+        .dispatch_all_detached(hub.sink())
         .map_err(|error| basic_error(&error, basic_ack::ACK))?;
     Ok(Vec::new())
 }
@@ -52,8 +51,7 @@ pub async fn nack(
         .await
         .map_err(|error| basic_error(&error, basic_ack::NACK))?;
     vhost
-        .dispatch_all(hub.sink())
-        .await
+        .dispatch_all_detached(hub.sink())
         .map_err(|error| basic_error(&error, basic_ack::NACK))?;
     Ok(Vec::new())
 }
@@ -74,8 +72,7 @@ pub async fn reject(
         .await
         .map_err(|error| basic_error(&error, basic_ack::REJECT))?;
     vhost
-        .dispatch_all(hub.sink())
-        .await
+        .dispatch_all_detached(hub.sink())
         .map_err(|error| basic_error(&error, basic_ack::REJECT))?;
     Ok(Vec::new())
 }
@@ -139,8 +136,7 @@ async fn requeue_all(
         .await
         .map_err(|error| basic_error(&error, method_id))?;
     vhost
-        .dispatch_all(hub.sink())
-        .await
+        .dispatch_all_detached(hub.sink())
         .map_err(|error| basic_error(&error, method_id))?;
     Ok(())
 }

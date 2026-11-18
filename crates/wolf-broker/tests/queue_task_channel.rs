@@ -1,15 +1,15 @@
 use std::future::poll_fn;
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Arc, Mutex};
 use std::task::Poll;
 use std::time::Duration;
 
 use bytes::Bytes;
-use tokio::sync::oneshot;
+use tokio::sync::{Barrier, oneshot};
 use tokio::time::timeout;
 use wolf_broker::queue::ConnectionId;
 use wolf_broker::{
-    ChannelId, ConsumerCancel, ConsumerId, ConsumerOptions, Delivery, DeliverySink, Message,
-    PublishRequest, QueueConfig, Vhost, VhostConfig, VhostId, VhostName,
+    ChannelId, ConsumerCancel, ConsumerId, ConsumerOptions, DeliverOutcome, Delivery, DeliverySink,
+    Message, PublishRequest, QueueConfig, Vhost, VhostConfig, VhostId, VhostName,
 };
 
 const SAFETY: Duration = Duration::from_secs(10);
@@ -22,11 +22,11 @@ struct BlockingSink {
 }
 
 impl DeliverySink for BlockingSink {
-    fn deliver(&mut self, delivery: Delivery) {
+    async fn deliver(&mut self, delivery: Delivery) -> DeliverOutcome {
         if let Some(entered) = self.entered.take() {
             let _ = entered.send(());
         }
-        self.barrier.wait();
+        self.barrier.wait().await;
         let body = delivery.message.body().clone();
         self.record
             .lock()
@@ -35,9 +35,12 @@ impl DeliverySink for BlockingSink {
         if let Some(delivered) = self.delivered.take() {
             let _ = delivered.send(body);
         }
+        DeliverOutcome::Delivered
     }
 
-    fn cancel(&mut self, _cancel: ConsumerCancel) {}
+    fn cancel(&mut self, _cancel: ConsumerCancel) -> impl Future<Output = ()> + Send {
+        std::future::ready(())
+    }
 }
 
 struct SignalSink {
@@ -46,7 +49,7 @@ struct SignalSink {
 }
 
 impl DeliverySink for SignalSink {
-    fn deliver(&mut self, delivery: Delivery) {
+    async fn deliver(&mut self, delivery: Delivery) -> DeliverOutcome {
         let body = delivery.message.body().clone();
         self.record
             .lock()
@@ -55,9 +58,12 @@ impl DeliverySink for SignalSink {
         if let Some(delivered) = self.delivered.take() {
             let _ = delivered.send(body);
         }
+        DeliverOutcome::Delivered
     }
 
-    fn cancel(&mut self, _cancel: ConsumerCancel) {}
+    fn cancel(&mut self, _cancel: ConsumerCancel) -> impl Future<Output = ()> + Send {
+        std::future::ready(())
+    }
 }
 
 fn message(body: &'static [u8]) -> Message {
@@ -148,7 +154,7 @@ async fn queue_task_channel_backpressure() {
         "no delivery is recorded before the barrier is released"
     );
 
-    barrier.wait();
+    barrier.wait().await;
 
     let first_body = timeout(SAFETY, first_delivered_rx)
         .await

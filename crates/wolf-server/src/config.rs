@@ -18,11 +18,15 @@ pub const MEMORY_HIGH_WATERMARK_RELATIVE_ENV: &str = "WOLF_MEMORY_HIGH_WATERMARK
 pub const MEMORY_HIGH_WATERMARK_BYTES_ENV: &str = "WOLF_MEMORY_HIGH_WATERMARK_BYTES";
 /// Environment variable that sets the memory check interval in milliseconds.
 pub const MEMORY_CHECK_INTERVAL_MS_ENV: &str = "WOLF_MEMORY_CHECK_INTERVAL_MS";
+/// Environment variable that sets each connection's outbox capacity.
+pub const OUTBOX_CAPACITY_ENV: &str = "WOLF_OUTBOX_CAPACITY";
 
 /// Default relative memory high watermark.
 pub const DEFAULT_MEMORY_HIGH_WATERMARK_RELATIVE: f64 = 0.4;
 /// Default memory check interval in milliseconds.
 pub const DEFAULT_MEMORY_CHECK_INTERVAL_MS: u64 = 1000;
+/// Default capacity of each connection's bounded outbox.
+pub const DEFAULT_OUTBOX_CAPACITY: usize = crate::delivery::DEFAULT_OUTBOX_CAPACITY;
 
 /// Configuration used to start a Wolf server.
 #[derive(Debug, Clone, PartialEq)]
@@ -39,6 +43,8 @@ pub struct ServerConfig {
     pub memory_high_watermark: MemoryHighWatermark,
     /// Interval between process RSS samples.
     pub memory_check_interval: Duration,
+    /// Capacity of each connection's bounded delivery outbox.
+    pub outbox_capacity: usize,
 }
 
 impl ServerConfig {
@@ -68,14 +74,17 @@ impl ServerConfig {
         let relative = lookup(MEMORY_HIGH_WATERMARK_RELATIVE_ENV)?;
         let absolute = lookup(MEMORY_HIGH_WATERMARK_BYTES_ENV)?;
         let interval = lookup(MEMORY_CHECK_INTERVAL_MS_ENV)?;
+        let outbox_capacity = lookup(OUTBOX_CAPACITY_ENV)?;
 
         let memory_high_watermark = resolve_memory_high_watermark(relative, absolute)?;
         let memory_check_interval = resolve_memory_check_interval(interval)?;
+        let outbox_capacity = resolve_outbox_capacity(outbox_capacity)?;
 
         Ok(Self {
             account,
             memory_high_watermark,
             memory_check_interval,
+            outbox_capacity,
             ..Self::default()
         })
     }
@@ -92,6 +101,7 @@ impl Default for ServerConfig {
                 DEFAULT_MEMORY_HIGH_WATERMARK_RELATIVE,
             ),
             memory_check_interval: Duration::from_millis(DEFAULT_MEMORY_CHECK_INTERVAL_MS),
+            outbox_capacity: DEFAULT_OUTBOX_CAPACITY,
         }
     }
 }
@@ -190,6 +200,21 @@ fn resolve_memory_check_interval(raw: Option<String>) -> Result<Duration, Config
     Ok(Duration::from_millis(millis))
 }
 
+fn resolve_outbox_capacity(raw: Option<String>) -> Result<usize, ConfigError> {
+    let Some(raw) = raw else {
+        return Ok(DEFAULT_OUTBOX_CAPACITY);
+    };
+
+    let capacity: usize = raw
+        .trim()
+        .parse()
+        .map_err(|_| ConfigError::InvalidOutboxCapacity { value: raw.clone() })?;
+    if capacity == 0 {
+        return Err(ConfigError::InvalidOutboxCapacity { value: raw });
+    }
+    Ok(capacity)
+}
+
 fn invalid_memory_setting(
     variable: &'static str,
     value: &str,
@@ -220,6 +245,11 @@ pub enum ConfigError {
         /// Description of the accepted values.
         expected: &'static str,
     },
+    /// The outbox capacity environment variable had an invalid value.
+    InvalidOutboxCapacity {
+        /// Raw configured value.
+        value: String,
+    },
 }
 
 impl fmt::Display for ConfigError {
@@ -242,6 +272,10 @@ impl fmt::Display for ConfigError {
             } => write!(
                 f,
                 "environment variable {variable} has invalid value {value:?}: expected {expected}"
+            ),
+            Self::InvalidOutboxCapacity { value } => write!(
+                f,
+                "environment variable {OUTBOX_CAPACITY_ENV} has invalid value {value:?}: expected a positive number"
             ),
         }
     }
@@ -492,5 +526,46 @@ mod tests {
             ServerConfig::from_lookup(source(&[(DEFAULT_USER_ENV, "alice")])),
             Err(ConfigError::IncompleteCredentials)
         );
+    }
+
+    #[test]
+    fn outbox_capacity_defaults_and_parses_override() {
+        let config = ServerConfig::from_lookup(source(&[])).expect("defaults are valid");
+        assert_eq!(config.outbox_capacity, DEFAULT_OUTBOX_CAPACITY);
+        assert_eq!(
+            ServerConfig::default().outbox_capacity,
+            DEFAULT_OUTBOX_CAPACITY
+        );
+
+        let config = ServerConfig::from_lookup(source(&[(OUTBOX_CAPACITY_ENV, "2")]))
+            .expect("capacity is valid");
+        assert_eq!(config.outbox_capacity, 2);
+
+        let config = ServerConfig::from_lookup(source(&[(OUTBOX_CAPACITY_ENV, "  64 ")]))
+            .expect("capacity is trimmed");
+        assert_eq!(config.outbox_capacity, 64);
+    }
+
+    #[test]
+    fn invalid_outbox_capacities_are_rejected() {
+        for raw in ["0", "abc", "-1", "not-a-number", ""] {
+            match ServerConfig::from_lookup(source(&[(OUTBOX_CAPACITY_ENV, raw)])) {
+                Err(ConfigError::InvalidOutboxCapacity { value }) => {
+                    assert_eq!(value, raw);
+                }
+                other => panic!("expected an invalid outbox capacity, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_outbox_capacity_display_names_variable_and_expectation() {
+        let error = ConfigError::InvalidOutboxCapacity {
+            value: "0".to_string(),
+        };
+        let message = error.to_string();
+        assert!(message.contains(OUTBOX_CAPACITY_ENV));
+        assert!(message.contains('0'));
+        assert!(message.contains("a positive number"));
     }
 }
