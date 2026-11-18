@@ -159,6 +159,10 @@ impl<'a> Reader<'a> {
         Ok(u32::from_be_bytes(self.read_array::<4>()?))
     }
 
+    pub(crate) fn read_u64(&mut self) -> Result<u64> {
+        Ok(u64::from_be_bytes(self.read_array::<8>()?))
+    }
+
     pub(crate) fn read_array<const N: usize>(&mut self) -> Result<[u8; N]> {
         self.require(N)?;
         let mut out = [0u8; N];
