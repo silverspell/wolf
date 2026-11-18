@@ -16,10 +16,12 @@ pub mod writer;
 pub use amqp::auth::Account;
 pub use config::{
     ConfigError, DEFAULT_MEMORY_CHECK_INTERVAL_MS, DEFAULT_MEMORY_HIGH_WATERMARK_RELATIVE,
-    DEFAULT_OUTBOX_CAPACITY, MEMORY_CHECK_INTERVAL_MS_ENV, MEMORY_HIGH_WATERMARK_BYTES_ENV,
-    MEMORY_HIGH_WATERMARK_RELATIVE_ENV, OUTBOX_CAPACITY_ENV, ServerConfig,
+    DEFAULT_OUTBOX_CAPACITY, DEFAULT_QUEUE_CHANNEL_CAPACITY, MEMORY_CHECK_INTERVAL_MS_ENV,
+    MEMORY_HIGH_WATERMARK_BYTES_ENV, MEMORY_HIGH_WATERMARK_RELATIVE_ENV, OUTBOX_CAPACITY_ENV,
+    ServerConfig,
 };
-pub use listener::{ShutdownError, ShutdownHandle, start};
+pub use listener::{ShutdownError, ShutdownHandle, start, start_with_memory_probe};
 pub use memory::{
-    MemoryHighWatermark, MemoryLimit, MemorySource, MemoryTotal, total_memory, used_memory,
+    ManualMemoryProbe, MemoryHighWatermark, MemoryLimit, MemoryProbe, MemorySource, MemoryTotal,
+    SystemMemoryProbe, total_memory, used_memory,
 };

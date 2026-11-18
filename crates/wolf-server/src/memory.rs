@@ -1,6 +1,7 @@
 //! Memory high-watermark configuration and total/used memory sampling.
 
 use std::io;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Fraction of the system total above which the memory watermark is exceeded.
 const CGROUP_V1_UNLIMITED_SENTINEL: u64 = 1 << 62;
@@ -56,6 +57,85 @@ pub struct MemoryLimit {
     pub source: MemorySource,
     /// Threshold in bytes derived from the configured high watermark.
     pub high_watermark_bytes: u64,
+}
+
+/// A source of total and in-use memory samples for the memory alarm.
+///
+/// Production uses [`SystemMemoryProbe`]; tests can inject a
+/// [`ManualMemoryProbe`] to drive the alarm deterministically.
+pub trait MemoryProbe: Send + Sync {
+    /// Returns the total memory available to the process in bytes.
+    fn total_bytes(&self) -> io::Result<u64>;
+    /// Returns the resident memory currently in use in bytes.
+    fn used_bytes(&self) -> io::Result<u64>;
+}
+
+/// A probe backed by the platform total-memory and process-RSS readers.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SystemMemoryProbe;
+
+impl SystemMemoryProbe {
+    /// Creates a system memory probe.
+    pub const fn new() -> Self {
+        Self
+    }
+}
+
+impl MemoryProbe for SystemMemoryProbe {
+    fn total_bytes(&self) -> io::Result<u64> {
+        total_memory().map(|total| total.bytes)
+    }
+
+    fn used_bytes(&self) -> io::Result<u64> {
+        used_memory()
+    }
+}
+
+/// A manually controlled probe whose usage tests can change at any time.
+#[derive(Debug)]
+pub struct ManualMemoryProbe {
+    total_bytes: AtomicU64,
+    used_bytes: AtomicU64,
+}
+
+impl ManualMemoryProbe {
+    /// Creates a probe with fixed total memory and an initial usage value.
+    pub fn new(total_bytes: u64, used_bytes: u64) -> Self {
+        Self {
+            total_bytes: AtomicU64::new(total_bytes),
+            used_bytes: AtomicU64::new(used_bytes),
+        }
+    }
+
+    /// Replaces the reported total memory.
+    pub fn set_total_bytes(&self, bytes: u64) {
+        self.total_bytes.store(bytes, Ordering::Release);
+    }
+
+    /// Replaces the reported memory usage.
+    pub fn set_used_bytes(&self, bytes: u64) {
+        self.used_bytes.store(bytes, Ordering::Release);
+    }
+
+    /// Returns the currently reported total memory.
+    pub fn total(&self) -> u64 {
+        self.total_bytes.load(Ordering::Acquire)
+    }
+
+    /// Returns the currently reported memory usage.
+    pub fn usage(&self) -> u64 {
+        self.used_bytes.load(Ordering::Acquire)
+    }
+}
+
+impl MemoryProbe for ManualMemoryProbe {
+    fn total_bytes(&self) -> io::Result<u64> {
+        Ok(self.total())
+    }
+
+    fn used_bytes(&self) -> io::Result<u64> {
+        Ok(self.usage())
+    }
 }
 
 /// Resolves the total memory from raw cgroup values and system RAM.

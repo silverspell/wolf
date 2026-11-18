@@ -7,11 +7,11 @@ use std::sync::Arc;
 use tokio::sync::mpsc::Sender;
 use wolf_amqp_codec::{
     BasicAck, BasicCancel, BasicConsume, BasicGet, BasicMethod, BasicNack, BasicPublish, BasicQos,
-    BasicRecover, BasicRecoverAsync, BasicReject, ChannelCloseOk, ChannelFlowOk, ChannelMethod,
-    ChannelOpenOk, CloseOk, ConfirmMethod, ConnectionMethod, ContentHeader, ExchangeMethod,
-    FieldTable, FieldValue, Frame, LongString, Method, OpenOk, QueueMethod, ShortString, Start,
-    StartOk, Tune, TuneOk, basic, basic_ack, basic_consume, basic_recover, channel, confirm,
-    connection, exchange, queue,
+    BasicRecover, BasicRecoverAsync, BasicReject, Blocked, ChannelCloseOk, ChannelFlowOk,
+    ChannelMethod, ChannelOpenOk, CloseOk, ConfirmMethod, ConnectionMethod, ContentHeader,
+    ExchangeMethod, FieldTable, FieldValue, Frame, LongString, Method, OpenOk, QueueMethod,
+    ShortString, Start, StartOk, Tune, TuneOk, Unblocked, basic, basic_ack, basic_consume,
+    basic_recover, channel, confirm, connection, exchange, queue,
 };
 use wolf_broker::{
     Broker, ChannelId, ConnectionId as BrokerConnectionId, Message, MessageMetadata,
@@ -74,6 +74,10 @@ pub struct Connection {
     consumers: ConsumerDirectory,
     hub: Arc<DeliveryHub>,
     outbox: Sender<ServerEvent>,
+    connection_blocked_capability: bool,
+    memory_alarm: bool,
+    blocked_sent: bool,
+    deferred_publish: Option<(u16, CompletedPublish)>,
     cleaned: bool,
 }
 
@@ -119,6 +123,10 @@ impl Connection {
             consumers: ConsumerDirectory::new(),
             hub,
             outbox,
+            connection_blocked_capability: false,
+            memory_alarm: false,
+            blocked_sent: false,
+            deferred_publish: None,
             cleaned: false,
         }
     }
@@ -141,6 +149,63 @@ impl Connection {
     /// Returns the negotiated heartbeat interval in seconds.
     pub const fn heartbeat_interval(&self) -> u16 {
         self.heartbeat
+    }
+
+    /// Returns whether the client advertised the `connection.blocked`
+    /// capability in `connection.start-ok`.
+    pub const fn connection_blocked_capability(&self) -> bool {
+        self.connection_blocked_capability
+    }
+
+    /// Returns whether the memory alarm is currently active.
+    pub const fn is_memory_alarmed(&self) -> bool {
+        self.memory_alarm
+    }
+
+    /// Returns whether socket reads must pause to bound deferred publishes.
+    ///
+    /// At most one completed publish may wait for the alarm to clear. Once it
+    /// is deferred, another publish would exceed that bound, so the session
+    /// retains the undecoded bytes and applies TCP backpressure.
+    pub const fn read_paused(&self) -> bool {
+        self.memory_alarm && self.deferred_publish.is_some()
+    }
+
+    /// Applies a memory-alarm transition, returning frames to write.
+    ///
+    /// Raising the alarm notifies capable open connections with
+    /// `connection.blocked`. Clearing it emits `connection.unblocked` only when
+    /// a block was actually sent, then drains the deferred publish through the
+    /// normal routing and confirm path.
+    pub async fn set_memory_alarm(&mut self, active: bool) -> Result<Vec<Frame>, AmqpError> {
+        self.memory_alarm = active;
+        if active {
+            let mut frames = Vec::new();
+            self.push_blocked_frame(&mut frames);
+            return Ok(frames);
+        }
+
+        let mut frames = Vec::new();
+        if self.blocked_sent {
+            self.blocked_sent = false;
+            frames.push(unblocked_frame());
+        }
+        if let Some((channel, completed)) = self.deferred_publish.take() {
+            let mut routed = self.route_completed_publish(channel, completed).await?;
+            frames.append(&mut routed);
+        }
+        Ok(frames)
+    }
+
+    fn push_blocked_frame(&mut self, frames: &mut Vec<Frame>) {
+        if self.memory_alarm
+            && self.connection_blocked_capability
+            && self.state == State::Open
+            && !self.blocked_sent
+        {
+            self.blocked_sent = true;
+            frames.push(blocked_frame());
+        }
     }
 
     /// Returns the negotiated maximum channel number.
@@ -305,6 +370,8 @@ impl Connection {
             &self.account,
         )
         .map_err(AuthError::into_amqp)?;
+        self.connection_blocked_capability =
+            supports_connection_blocked(&start_ok.client_properties);
         self.state = State::AwaitingTuneOk;
         Ok(vec![self.tune_frame()])
     }
@@ -343,12 +410,14 @@ impl Connection {
             Ok(vhost) => {
                 self.vhost = Some(vhost.name().clone());
                 self.state = State::Open;
-                Ok(vec![Frame::Method {
+                let mut frames = vec![Frame::Method {
                     channel: 0,
                     method: Method::Connection(ConnectionMethod::OpenOk(OpenOk {
                         known_hosts: ShortString::new(""),
                     })),
-                }])
+                }];
+                self.push_blocked_frame(&mut frames);
+                Ok(frames)
             }
             Err(error) => {
                 let mapped = AmqpError::from_domain(&error);
@@ -662,6 +731,28 @@ impl Connection {
         frame_channel: u16,
         completed: CompletedPublish,
     ) -> Result<Vec<Frame>, AmqpError> {
+        if let Some(channel) = self.channels.get_mut(&frame_channel) {
+            channel.pending_publish = None;
+        }
+
+        if self.memory_alarm {
+            if self.deferred_publish.is_some() {
+                return Err(unexpected_frame(
+                    "only one publish may wait for the memory alarm",
+                ));
+            }
+            self.deferred_publish = Some((frame_channel, completed));
+            return Ok(Vec::new());
+        }
+
+        self.route_completed_publish(frame_channel, completed).await
+    }
+
+    async fn route_completed_publish(
+        &mut self,
+        frame_channel: u16,
+        completed: CompletedPublish,
+    ) -> Result<Vec<Frame>, AmqpError> {
         let Some(vhost_name) = self.vhost.clone() else {
             return Err(self.command_invalid(0, 0, "connection has no open vhost"));
         };
@@ -703,7 +794,6 @@ impl Connection {
             })?;
 
         if let Some(channel) = self.channels.get_mut(&frame_channel) {
-            channel.pending_publish = None;
             if let Some(sequence) = channel.confirm.next_publish_sequence() {
                 frames.push(ConfirmState::ack_frame(frame_channel, sequence));
             }
@@ -1042,6 +1132,32 @@ fn unexpected_frame(text: impl Into<String>) -> AmqpError {
     AmqpError::connection(ReplyCode::UnexpectedFrame, text)
 }
 
+fn supports_connection_blocked(properties: &FieldTable) -> bool {
+    let Some(FieldValue::FieldTable(capabilities)) = properties.get("capabilities") else {
+        return false;
+    };
+    matches!(
+        capabilities.get("connection.blocked"),
+        Some(FieldValue::Bool(true))
+    )
+}
+
+fn blocked_frame() -> Frame {
+    Frame::Method {
+        channel: 0,
+        method: Method::Connection(ConnectionMethod::Blocked(Blocked {
+            reason: ShortString::new("low on memory"),
+        })),
+    }
+}
+
+fn unblocked_frame() -> Frame {
+    Frame::Method {
+        channel: 0,
+        method: Method::Connection(ConnectionMethod::Unblocked(Unblocked)),
+    }
+}
+
 fn negotiate_limit_u16(server: u16, client: u16) -> u16 {
     match (server, client) {
         (0, client) => client,
@@ -1087,6 +1203,7 @@ pub fn capabilities() -> FieldTable {
         "consumer_cancel_notify",
         "per_consumer_qos",
         "authentication_failure_close",
+        "connection.blocked",
     ] {
         capabilities.insert(capability, FieldValue::Bool(true));
     }
@@ -1130,15 +1247,16 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_are_exactly_the_five_m1_entries() {
+    fn capabilities_are_exactly_the_six_m1_entries() {
         let capabilities = capabilities();
-        assert_eq!(capabilities.len(), 5);
+        assert_eq!(capabilities.len(), 6);
         for required in [
             "publisher_confirms",
             "basic.nack",
             "consumer_cancel_notify",
             "per_consumer_qos",
             "authentication_failure_close",
+            "connection.blocked",
         ] {
             assert_eq!(
                 capabilities.get(required),
@@ -1146,7 +1264,7 @@ mod tests {
                 "{required} must be advertised"
             );
         }
-        for forbidden in ["connection.blocked", "connection.unblocked", "channel.flow"] {
+        for forbidden in ["connection.unblocked", "channel.flow"] {
             assert!(!capabilities.contains_key(forbidden));
         }
     }
