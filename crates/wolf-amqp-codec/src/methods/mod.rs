@@ -13,13 +13,19 @@ pub mod exchange;
 pub mod queue;
 pub mod tx;
 
+use confirm::ConfirmMethod;
 use connection::ConnectionMethod;
+use tx::TxMethod;
 
 /// A decoded AMQP method.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Method {
     /// A method from the connection class.
     Connection(ConnectionMethod),
+    /// A method from the confirm class.
+    Confirm(ConfirmMethod),
+    /// A method from the tx class.
+    Tx(TxMethod),
 }
 
 impl Method {
@@ -27,6 +33,8 @@ impl Method {
     pub fn class_id(&self) -> u16 {
         match self {
             Self::Connection(method) => method.class_id(),
+            Self::Confirm(method) => method.class_id(),
+            Self::Tx(method) => method.class_id(),
         }
     }
 
@@ -34,6 +42,8 @@ impl Method {
     pub fn method_id(&self) -> u16 {
         match self {
             Self::Connection(method) => method.method_id(),
+            Self::Confirm(method) => method.method_id(),
+            Self::Tx(method) => method.method_id(),
         }
     }
 
@@ -48,6 +58,8 @@ impl Method {
             connection::CLASS_ID => {
                 Self::Connection(ConnectionMethod::decode(method_id, &mut reader)?)
             }
+            confirm::CLASS_ID => Self::Confirm(ConfirmMethod::decode(method_id, &mut reader)?),
+            tx::CLASS_ID => Self::Tx(TxMethod::decode(method_id, &mut reader)?),
             other => return Err(Error::UnsupportedClass { class_id: other }),
         };
         if reader.remaining() != 0 {
@@ -65,6 +77,8 @@ impl Method {
         writer.write_u16(self.method_id());
         match self {
             Self::Connection(method) => writer.write_bytes(&method.encode_body()?),
+            Self::Confirm(method) => writer.write_bytes(&method.encode_body()?),
+            Self::Tx(method) => writer.write_bytes(&method.encode_body()?),
         }
         Ok(writer.into_inner())
     }
@@ -84,5 +98,17 @@ impl Method {
 impl From<ConnectionMethod> for Method {
     fn from(method: ConnectionMethod) -> Self {
         Self::Connection(method)
+    }
+}
+
+impl From<ConfirmMethod> for Method {
+    fn from(method: ConfirmMethod) -> Self {
+        Self::Confirm(method)
+    }
+}
+
+impl From<TxMethod> for Method {
+    fn from(method: TxMethod) -> Self {
+        Self::Tx(method)
     }
 }

@@ -132,7 +132,9 @@ fn dispatch_selects_the_right_variant() {
         let encoded = Method::from(method.clone()).encode();
         let decoded = Method::decode(&Bytes::from(encoded)).unwrap();
 
-        let Method::Connection(decoded_method) = decoded;
+        let Method::Connection(decoded_method) = decoded else {
+            panic!("expected a connection method, got {decoded:?}");
+        };
         assert_eq!(variant_name(&decoded_method), variant_name(&method));
     }
 }
