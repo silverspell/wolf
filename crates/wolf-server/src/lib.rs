@@ -10,6 +10,7 @@ pub mod config;
 pub mod delivery;
 pub mod listener;
 pub mod session;
+pub mod writer;
 
 pub use amqp::auth::Account;
 pub use config::{ConfigError, ServerConfig};

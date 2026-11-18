@@ -1,5 +1,7 @@
 //! AMQP connection class (class id 10) methods.
 
+use bytes::BufMut;
+
 use crate::error::{Error, Result};
 use crate::types::{FieldTable, LongString, Reader, ShortString, Writer};
 
@@ -149,8 +151,7 @@ impl ConnectionMethod {
         }
     }
 
-    pub(crate) fn encode_body(&self) -> Result<Vec<u8>> {
-        let mut writer = Writer::new();
+    pub(crate) fn encode_body_into<B: BufMut>(&self, writer: &mut Writer<B>) -> Result<()> {
         match self {
             Self::Start(method) => {
                 writer.write_u8(method.version_major);
@@ -166,13 +167,13 @@ impl ConnectionMethod {
                 writer.write_short_string(method.locale.as_str())?;
             }
             Self::Tune(method) => encode_tune(
-                &mut writer,
+                writer,
                 method.channel_max,
                 method.frame_max,
                 method.heartbeat,
             ),
             Self::TuneOk(method) => encode_tune(
-                &mut writer,
+                writer,
                 method.channel_max,
                 method.frame_max,
                 method.heartbeat,
@@ -193,7 +194,7 @@ impl ConnectionMethod {
             }
             Self::CloseOk(_) => {}
         }
-        Ok(writer.into_inner())
+        Ok(())
     }
 
     pub(crate) fn decode(method_id: u16, reader: &mut Reader<'_>) -> Result<Self> {
@@ -253,7 +254,12 @@ impl ConnectionMethod {
     }
 }
 
-fn encode_tune(writer: &mut Writer, channel_max: u16, frame_max: u32, heartbeat: u16) {
+fn encode_tune<B: BufMut>(
+    writer: &mut Writer<B>,
+    channel_max: u16,
+    frame_max: u32,
+    heartbeat: u16,
+) {
     writer.write_u16(channel_max);
     writer.write_u32(frame_max);
     writer.write_u16(heartbeat);

@@ -1,5 +1,7 @@
 //! AMQP Tx class (90) methods.
 
+use bytes::BufMut;
+
 use crate::error::{Error, Result};
 use crate::types::{Reader, Writer};
 
@@ -78,9 +80,8 @@ impl TxMethod {
         }
     }
 
-    pub(crate) fn encode_body(&self) -> Result<Vec<u8>> {
-        let writer = Writer::new();
-        Ok(writer.into_inner())
+    pub(crate) fn encode_body_into<B: BufMut>(&self, _writer: &mut Writer<B>) -> Result<()> {
+        Ok(())
     }
 
     pub(crate) fn decode(method_id: u16, _reader: &mut Reader<'_>) -> Result<Self> {
