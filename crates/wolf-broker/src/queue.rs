@@ -78,13 +78,19 @@ struct ConsumerEntry {
     connection: ConnectionId,
 }
 
+#[derive(Debug, Clone)]
+struct QueuedMessage {
+    message: Message,
+    redelivered: bool,
+}
+
 /// A declared queue with its stored messages and consumers.
 #[derive(Debug, Clone)]
 pub struct Queue {
     name: QueueName,
     config: QueueConfig,
     owner: ConnectionId,
-    messages: VecDeque<Message>,
+    messages: VecDeque<QueuedMessage>,
     consumers: Vec<ConsumerEntry>,
 }
 
@@ -139,9 +145,9 @@ impl Queue {
         self.messages.is_empty()
     }
 
-    /// Returns the stored messages in publish order.
-    pub fn messages(&self) -> &VecDeque<Message> {
-        &self.messages
+    /// Iterates over the stored messages in publish order.
+    pub fn messages(&self) -> impl Iterator<Item = &Message> + '_ {
+        self.messages.iter().map(|entry| &entry.message)
     }
 
     /// Returns the number of tracked consumers.
@@ -325,8 +331,35 @@ impl QueueRegistry {
         message: Message,
     ) -> Result<(), DomainError> {
         let queue = self.queue_mut_for(name.as_ref(), connection)?;
-        queue.messages.push_back(message);
+        queue.messages.push_back(QueuedMessage {
+            message,
+            redelivered: false,
+        });
         Ok(())
+    }
+
+    pub(crate) fn take_message(&mut self, name: &str) -> Option<(Message, bool)> {
+        let queue = self.queues.get_mut(name)?;
+        queue
+            .messages
+            .pop_front()
+            .map(|entry| (entry.message, entry.redelivered))
+    }
+
+    pub(crate) fn requeue_message(
+        &mut self,
+        name: &str,
+        message: Message,
+        redelivered: bool,
+    ) -> bool {
+        let Some(queue) = self.queues.get_mut(name) else {
+            return false;
+        };
+        queue.messages.push_front(QueuedMessage {
+            message,
+            redelivered,
+        });
+        true
     }
 
     /// Removes all messages from a queue, returning how many were discarded.
