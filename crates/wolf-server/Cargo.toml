@@ -24,6 +24,7 @@ bytes.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+futures-lite = "2"
 lapin = "3"
 
 [lints]
