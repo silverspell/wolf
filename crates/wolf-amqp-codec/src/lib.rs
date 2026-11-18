@@ -1,1 +1,20 @@
 //! AMQP 0-9-1 frame and method encoding/decoding. Pure, no I/O.
+//!
+//! The codec covers the protocol header, frames, field tables and the
+//! connection method set needed for the M1 handshake. Higher-level classes are
+//! represented by class-id stubs until their tickets land.
+
+pub mod error;
+pub mod frame;
+pub mod methods;
+pub mod types;
+
+pub use error::{Error, Result};
+pub use frame::{
+    ContentHeader, FRAME_END, Frame, FrameType, MAX_FRAME_SIZE, ProtocolHeader, decode_frame,
+};
+pub use methods::connection::{
+    Close, CloseOk, ConnectionMethod, Open, OpenOk, Start, StartOk, Tune, TuneOk,
+};
+pub use methods::{Method, connection};
+pub use types::{FieldTable, FieldValue, LongString, MAX_TABLE_DEPTH, ShortString};
