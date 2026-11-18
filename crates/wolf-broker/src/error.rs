@@ -22,6 +22,9 @@ pub enum DomainError {
     QueueNotFound { vhost: String, queue: String },
     AlreadyExists { kind: ResourceKind, name: String },
     InvalidArgument { message: String },
+    AccessRefused { message: String },
+    PreconditionFailed { message: String },
+    CommandInvalid { message: String },
     BrokerClosed,
 }
 
@@ -39,6 +42,11 @@ impl fmt::Display for DomainError {
                 write!(f, "{kind:?} '{name}' already exists")
             }
             Self::InvalidArgument { message } => write!(f, "invalid argument: {message}"),
+            Self::AccessRefused { message } => write!(f, "access refused: {message}"),
+            Self::PreconditionFailed { message } => {
+                write!(f, "precondition failed: {message}")
+            }
+            Self::CommandInvalid { message } => write!(f, "command invalid: {message}"),
             Self::BrokerClosed => write!(f, "broker is closed"),
         }
     }
