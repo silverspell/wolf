@@ -1,0 +1,21 @@
+# SPDX-FileCopyrightText: LoopFlow
+# SPDX-License-Identifier: MIT
+# Source: https://github.com/silverspell/LoopFlow-BE
+rules:
+  - id: loopflow-runtime-exec
+    languages:
+      - java
+    severity: WARNING
+    message: >-
+      Calling Runtime.exec with a non-constant command can allow OS command
+      injection. Avoid shell execution or pass a fixed, validated command.
+    metadata:
+      author: "LoopFlow"
+      license: "MIT"
+      category: security
+      cwe: "CWE-78: Improper Neutralization of Special Elements used in an OS Command ('OS Command Injection')"
+      owasp: "A03:2021 - Injection"
+      confidence: HIGH
+      source: https://github.com/silverspell/LoopFlow-BE
+    pattern: |
+      $RUNTIME.getRuntime().exec(...)

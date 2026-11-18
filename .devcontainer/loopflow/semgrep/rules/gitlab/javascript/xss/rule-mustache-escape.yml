@@ -1,0 +1,48 @@
+# SPDX-FileCopyrightText: GitLab Inc.
+# SPDX-License-Identifier: MIT
+# Source: https://gitlab.com/gitlab-org/security-products/sast-rules/-/blob/v2.10.1/javascript/xss/rule-mustache-escape.yml
+# Modified by LoopFlow: added "typescript" to languages for .ts/.tsx support; modifications licensed under MIT.
+# yamllint disable
+# License: MIT (c) GitLab Inc.
+# yamllint enable
+---
+rules:
+- id: "javascript_xss_rule-mustache-escape"
+  languages:
+  - "javascript"
+  - "typescript"
+  patterns:
+  - pattern-inside: |
+      $OBJ = require('mustache')
+      ...
+  - pattern-either:
+    - pattern: |
+        $OBJ.escape = function($TEXT) {
+          ...
+          return $TEXT;
+        }
+    - patterns:
+      - metavariable-regex:
+          metavariable: "$X"
+          regex: "\"\\{\\{\\{(.+?)\\}\\}\\}\""
+      - pattern: "$OBJ.render($X, ... )"
+    - patterns:
+      - metavariable-regex:
+          metavariable: "$Y"
+          regex: "\"\\{\\{\\&(.+?)\\}\\}\""
+      - pattern: "$OBJ.render($Y, ... )"
+  severity: "WARNING"
+  message: |
+    Markup escaping disabled. This can be used with some template engines to escape
+    disabling of HTML entities, which can lead to XSS attacks.
+  metadata:
+    cwe: "CWE-79"
+    owasp:
+    - "A7:2017-Cross-Site Scripting (XSS)"
+    - "A03:2021-Injection"
+    - "A05:2025-Injection"
+    category: "security"
+    shortDescription: "Improper neutralization of input during web page generation
+      (XSS)"
+    # yamllint enable
+    security-severity: "Medium"

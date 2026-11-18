@@ -1,0 +1,39 @@
+# SPDX-FileCopyrightText: LoopFlow
+# SPDX-License-Identifier: MIT
+# Source: https://github.com/silverspell/LoopFlow-BE
+rules:
+  - id: loopflow-rust-dynamic-code-or-path-traversal
+    languages:
+      - rust
+    severity: WARNING
+    message: >-
+      Loading a library from a non-constant path can execute arbitrary code,
+      and building a file path by joining untrusted segments can allow path
+      traversal. Use fixed library locations and validate/normalize path
+      segments.
+    metadata:
+      author: "LoopFlow"
+      license: "MIT"
+      category: security
+      cwe:
+        - "CWE-95: Improper Neutralization of Directives in Dynamically Evaluated Code ('Eval Injection')"
+        - "CWE-22: Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')"
+      owasp:
+        - "A03:2021 - Injection"
+        - "A01:2021 - Broken Access Control"
+      confidence: HIGH
+      source: https://github.com/silverspell/LoopFlow-BE
+    pattern-either:
+      - patterns:
+          - pattern-either:
+              - pattern: libloading::Library::new($LIB)
+              - pattern: Library::new($LIB)
+              - pattern: libc::dlopen($LIB, ...)
+          - pattern-not: libloading::Library::new("...")
+          - pattern-not: Library::new("...")
+          - pattern-not: libc::dlopen("...", ...)
+      - pattern: Path::new($BASE).join($CHILD)
+      - pattern: PathBuf::from($BASE).join($CHILD)
+      - patterns:
+          - pattern: File::open($PATH)
+          - pattern-not: File::open("...")

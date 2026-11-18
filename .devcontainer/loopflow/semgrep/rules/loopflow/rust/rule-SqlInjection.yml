@@ -1,0 +1,32 @@
+# SPDX-FileCopyrightText: LoopFlow
+# SPDX-License-Identifier: MIT
+# Source: https://github.com/silverspell/LoopFlow-BE
+rules:
+  - id: loopflow-rust-sql-injection
+    languages:
+      - rust
+    severity: ERROR
+    message: >-
+      Building a SQL statement by formatting or concatenating values can allow
+      SQL injection. Use parameterized queries with bound values instead.
+    metadata:
+      author: "LoopFlow"
+      license: "MIT"
+      category: security
+      cwe: "CWE-89: Improper Neutralization of Special Elements used in an SQL Command ('SQL Injection')"
+      owasp: "A03:2021 - Injection"
+      confidence: HIGH
+      source: https://github.com/silverspell/LoopFlow-BE
+    pattern-either:
+      - pattern: sqlx::query(&format!(...))
+      - pattern: sqlx::query(format!(...))
+      - pattern: diesel::sql_query(&format!(...))
+      - pattern: diesel::sql_query(format!(...))
+      - pattern: $DB.query(&format!(...))
+      - pattern: $DB.query(format!(...))
+      - pattern: $DB.execute(&format!(...))
+      - pattern: $DB.execute(format!(...))
+      - pattern: sqlx::query($SQL + $X)
+      - pattern: diesel::sql_query($SQL + $X)
+      - pattern: $DB.query($SQL + $X)
+      - pattern: $DB.execute($SQL + $X)

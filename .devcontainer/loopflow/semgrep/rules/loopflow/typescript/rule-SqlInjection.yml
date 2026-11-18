@@ -1,0 +1,34 @@
+# SPDX-FileCopyrightText: LoopFlow
+# SPDX-License-Identifier: MIT
+# Source: https://github.com/silverspell/LoopFlow-BE
+rules:
+  - id: loopflow-typescript-sql-injection
+    languages:
+      - typescript
+    severity: ERROR
+    message: >-
+      Building a SQL statement by concatenating values can allow SQL injection.
+      Use parameterized queries with bound values instead.
+    metadata:
+      author: "LoopFlow"
+      license: "MIT"
+      category: security
+      cwe: "CWE-89: Improper Neutralization of Special Elements used in an SQL Command ('SQL Injection')"
+      owasp: "A03:2021 - Injection"
+      confidence: HIGH
+      source: https://github.com/silverspell/LoopFlow-BE
+    pattern-either:
+      - pattern: $DB.query($SQL + $X, ...)
+      - pattern: $DB.query($SQL + $X)
+      - pattern: $DB.execute($SQL + $X, ...)
+      - pattern: $DB.execute($SQL + $X)
+      - pattern: $DB.raw($SQL + $X, ...)
+      - pattern: $DB.raw($SQL + $X)
+      - pattern: $DB.prepare($SQL + $X, ...)
+      - pattern: $DB.prepare($SQL + $X)
+      - pattern: $DB.all($SQL + $X, ...)
+      - pattern: $DB.all($SQL + $X)
+      - pattern: $DB.get($SQL + $X, ...)
+      - pattern: $DB.get($SQL + $X)
+      - pattern: $DB.run($SQL + $X, ...)
+      - pattern: $DB.run($SQL + $X)
