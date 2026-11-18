@@ -20,6 +20,7 @@ use crate::amqp::auth::Account;
 use crate::config::ServerConfig;
 use crate::delivery::DeliveryHub;
 use crate::session::{ConnectionId, Session};
+use crate::writer::{DrainOutcome, drain_outbox, write_frame, write_frames};
 
 const RETRY_DELAY: Duration = Duration::from_millis(10);
 const HEARTBEAT_TICK: Duration = Duration::from_millis(250);
@@ -209,17 +210,16 @@ async fn run_session(
                 }
             },
             event = outbox_rx.recv() => match event {
-                Some(event) => match session.delivery_event(event) {
-                    Ok(frames) => {
-                        if write_frames(&mut stream, &frames).await.is_err() {
-                            break;
-                        }
-                    }
-                    Err(error) => {
-                        let close = error.to_frame(0);
-                        let _ = write_frame(&mut stream, &close).await;
-                        break;
-                    }
+                Some(event) => match drain_outbox(
+                    &mut stream,
+                    event,
+                    &mut outbox_rx,
+                    |event| session.delivery_event(event),
+                )
+                .await
+                {
+                    DrainOutcome::Continue => {}
+                    DrainOutcome::Disconnected | DrainOutcome::ProtocolError => break,
                 },
                 None => break,
             },
@@ -314,20 +314,6 @@ async fn process_buffer(
             Err(_) => return Err(()),
         }
     }
-}
-
-async fn write_frames(stream: &mut TcpStream, frames: &[Frame]) -> io::Result<()> {
-    for frame in frames {
-        write_frame(stream, frame).await?;
-    }
-    Ok(())
-}
-
-async fn write_frame(stream: &mut TcpStream, frame: &Frame) -> io::Result<()> {
-    let bytes = frame
-        .try_encode()
-        .map_err(|error| io::Error::other(error.to_string()))?;
-    stream.write_all(&bytes).await
 }
 
 async fn wait_for_shutdown(shutdown: &mut watch::Receiver<bool>) {

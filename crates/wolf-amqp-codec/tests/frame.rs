@@ -1,6 +1,6 @@
 mod support;
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use wolf_amqp_codec::{CloseOk, ConnectionMethod, ContentHeader, Frame, Method, decode_frame};
 
 #[test]
@@ -70,6 +70,71 @@ fn content_body_is_zero_copy_from_the_input_buffer() {
         }
         other => panic!("expected content body frame, got {other:?}"),
     }
+}
+
+#[test]
+fn content_body_is_zero_copy() {
+    let source = Bytes::from_static(b"hello body");
+    let frame = Frame::ContentBody {
+        channel: 5,
+        body: source.clone(),
+    };
+
+    let segments = frame.encode_segments().expect("content body encodes");
+    let body = segments.body().expect("content body has a body segment");
+
+    assert_eq!(
+        body.as_ptr(),
+        source.as_ptr(),
+        "body must share the source allocation"
+    );
+    assert_eq!(
+        segments.payload().as_ptr(),
+        source.as_ptr(),
+        "payload must share the source allocation"
+    );
+    assert_eq!(
+        segments.len(),
+        frame.try_encode().expect("frame encodes").len()
+    );
+}
+
+#[test]
+fn encode_into_reuses_buffer() {
+    let method = Frame::Method {
+        channel: 3,
+        method: Method::from(ConnectionMethod::CloseOk(CloseOk)),
+    };
+    let header = Frame::ContentHeader {
+        channel: 9,
+        header: ContentHeader {
+            class_id: 60,
+            weight: 0,
+            body_size: 1_234,
+            properties: Bytes::from_static(&[0x80, 0x00]),
+        },
+    };
+
+    let mut buffer = BytesMut::new();
+    method.encode_into(&mut buffer).expect("method encodes");
+    header.encode_into(&mut buffer).expect("header encodes");
+    let capacity = buffer.capacity();
+    let pointer = buffer.as_ptr();
+
+    buffer.clear();
+    method.encode_into(&mut buffer).expect("method re-encodes");
+    header.encode_into(&mut buffer).expect("header re-encodes");
+
+    assert_eq!(
+        buffer.capacity(),
+        capacity,
+        "second pass must not reallocate"
+    );
+    assert_eq!(
+        buffer.as_ptr(),
+        pointer,
+        "second pass must not move the buffer"
+    );
 }
 
 #[test]

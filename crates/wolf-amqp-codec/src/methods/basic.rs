@@ -1,5 +1,7 @@
 //! AMQP Basic class (60) methods.
 
+use bytes::BufMut;
+
 use crate::error::{Error, Result};
 use crate::methods::{bit_set, pack_bits};
 use crate::types::{Reader, Writer};
@@ -98,8 +100,7 @@ impl BasicMethod {
         }
     }
 
-    pub(crate) fn encode_body(&self) -> Result<Vec<u8>> {
-        let mut writer = Writer::new();
+    pub(crate) fn encode_body_into<B: BufMut>(&self, writer: &mut Writer<B>) -> Result<()> {
         match self {
             Self::Qos(method) => {
                 writer.write_u32(method.prefetch_size);
@@ -183,7 +184,7 @@ impl BasicMethod {
             }
             Self::RecoverOk(_) => {}
         }
-        Ok(writer.into_inner())
+        Ok(())
     }
 
     pub(crate) fn decode(method_id: u16, reader: &mut Reader<'_>) -> Result<Self> {

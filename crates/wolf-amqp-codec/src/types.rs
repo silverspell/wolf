@@ -1,6 +1,6 @@
 //! AMQP primitive types and low-level encoding helpers.
 
-use bytes::Bytes;
+use bytes::{BufMut, Bytes, BytesMut};
 use std::fmt;
 
 use crate::error::{Error, Result};
@@ -197,37 +197,65 @@ impl<'a> Reader<'a> {
 }
 
 #[derive(Debug)]
-pub(crate) struct Writer {
-    pub(crate) bytes: Vec<u8>,
+pub(crate) struct Writer<B = Vec<u8>> {
+    pub(crate) bytes: B,
+    len: usize,
 }
 
-impl Writer {
+impl Writer<Vec<u8>> {
     pub(crate) fn new() -> Self {
-        Self { bytes: Vec::new() }
+        Self {
+            bytes: Vec::new(),
+            len: 0,
+        }
+    }
+
+    pub(crate) fn with_capacity(capacity: usize) -> Self {
+        Self {
+            bytes: Vec::with_capacity(capacity),
+            len: 0,
+        }
     }
 
     pub(crate) fn into_inner(self) -> Vec<u8> {
         self.bytes
     }
+}
+
+impl<'a> Writer<&'a mut BytesMut> {
+    pub(crate) fn new_with(bytes: &'a mut BytesMut) -> Self {
+        Self { bytes, len: 0 }
+    }
+}
+
+impl<B: BufMut> Writer<B> {
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
 
     pub(crate) fn write_u8(&mut self, value: u8) {
-        self.bytes.push(value);
+        self.bytes.put_u8(value);
+        self.len += 1;
     }
 
     pub(crate) fn write_u16(&mut self, value: u16) {
-        self.bytes.extend_from_slice(&value.to_be_bytes());
+        self.bytes.put_u16(value);
+        self.len += 2;
     }
 
     pub(crate) fn write_u32(&mut self, value: u32) {
-        self.bytes.extend_from_slice(&value.to_be_bytes());
+        self.bytes.put_u32(value);
+        self.len += 4;
     }
 
     pub(crate) fn write_u64(&mut self, value: u64) {
-        self.bytes.extend_from_slice(&value.to_be_bytes());
+        self.bytes.put_u64(value);
+        self.len += 8;
     }
 
     pub(crate) fn write_bytes(&mut self, bytes: &[u8]) {
-        self.bytes.extend_from_slice(bytes);
+        self.bytes.put_slice(bytes);
+        self.len += bytes.len();
     }
 
     pub(crate) fn write_short_string(&mut self, value: &str) -> Result<()> {

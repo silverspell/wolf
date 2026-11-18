@@ -1,6 +1,6 @@
 //! AMQP method encoding and decoding.
 
-use bytes::Bytes;
+use bytes::{BufMut, Bytes, BytesMut};
 
 use crate::error::{Error, Result};
 use crate::types::{Reader, Writer};
@@ -112,19 +112,38 @@ impl Method {
 
     /// Encodes the method, returning an error for values that exceed AMQP limits.
     pub fn try_encode(&self) -> Result<Vec<u8>> {
-        let mut writer = Writer::new();
+        let mut writer = Writer::with_capacity(4);
+        self.encode_with(&mut writer)?;
+        Ok(writer.into_inner())
+    }
+
+    /// Appends the encoded method to `buffer`.
+    ///
+    /// The buffer is left unchanged when encoding fails.
+    pub fn encode_into(&self, buffer: &mut BytesMut) -> Result<()> {
+        let start = buffer.len();
+        let result = {
+            let mut writer = Writer::new_with(buffer);
+            self.encode_with(&mut writer)
+        };
+        if result.is_err() {
+            buffer.truncate(start);
+        }
+        result
+    }
+
+    fn encode_with<B: BufMut>(&self, writer: &mut Writer<B>) -> Result<()> {
         writer.write_u16(self.class_id());
         writer.write_u16(self.method_id());
         match self {
-            Self::Connection(method) => writer.write_bytes(&method.encode_body()?),
-            Self::Channel(method) => writer.write_bytes(&method.encode_body()?),
-            Self::Exchange(method) => writer.write_bytes(&method.encode_body()?),
-            Self::Queue(method) => writer.write_bytes(&method.encode_body()?),
-            Self::Confirm(method) => writer.write_bytes(&method.encode_body()?),
-            Self::Tx(method) => writer.write_bytes(&method.encode_body()?),
-            Self::Basic(method) => writer.write_bytes(&method.encode_body()?),
+            Self::Connection(method) => method.encode_body_into(writer),
+            Self::Channel(method) => method.encode_body_into(writer),
+            Self::Exchange(method) => method.encode_body_into(writer),
+            Self::Queue(method) => method.encode_body_into(writer),
+            Self::Confirm(method) => method.encode_body_into(writer),
+            Self::Tx(method) => method.encode_body_into(writer),
+            Self::Basic(method) => method.encode_body_into(writer),
         }
-        Ok(writer.into_inner())
     }
 
     /// Encodes the method into its AMQP wire representation.

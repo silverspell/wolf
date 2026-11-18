@@ -1,5 +1,7 @@
 //! AMQP Queue class (50) methods.
 
+use bytes::BufMut;
+
 use crate::error::{Error, Result};
 use crate::methods::{bit_set, pack_bits};
 use crate::types::{FieldTable, Reader, ShortString, Writer};
@@ -187,8 +189,7 @@ impl QueueMethod {
         }
     }
 
-    pub(crate) fn encode_body(&self) -> Result<Vec<u8>> {
-        let mut writer = Writer::new();
+    pub(crate) fn encode_body_into<B: BufMut>(&self, writer: &mut Writer<B>) -> Result<()> {
         match self {
             Self::Declare(method) => {
                 writer.write_u16(method.ticket);
@@ -245,7 +246,7 @@ impl QueueMethod {
             }
             Self::UnbindOk(_) => {}
         }
-        Ok(writer.into_inner())
+        Ok(())
     }
 
     pub(crate) fn decode(method_id: u16, reader: &mut Reader<'_>) -> Result<Self> {

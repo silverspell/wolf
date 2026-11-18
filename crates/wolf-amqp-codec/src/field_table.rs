@@ -4,7 +4,7 @@
 //! values. Values use the RabbitMQ AMQP 0-9-1 type-byte mapping and may nest
 //! tables and arrays up to [`MAX_TABLE_DEPTH`].
 
-use bytes::Bytes;
+use bytes::{BufMut, Bytes};
 
 use crate::error::{Error, Result};
 use crate::types::{LongString, Reader, ShortString, Writer};
@@ -56,7 +56,7 @@ pub enum FieldValue {
 }
 
 impl FieldValue {
-    fn encode(&self, writer: &mut Writer, depth: usize) -> Result<()> {
+    fn encode<B: BufMut>(&self, writer: &mut Writer<B>, depth: usize) -> Result<()> {
         match self {
             Self::Bool(value) => {
                 writer.write_u8(b't');
@@ -290,7 +290,7 @@ impl Reader<'_> {
     }
 }
 
-impl Writer {
+impl<B: BufMut> Writer<B> {
     pub(crate) fn write_field_table(&mut self, table: &FieldTable, depth: usize) -> Result<()> {
         if depth > MAX_TABLE_DEPTH {
             return Err(Error::TableNestingTooDeep { depth });
@@ -300,9 +300,10 @@ impl Writer {
             body.write_short_string(key.as_str())?;
             value.encode(&mut body, depth)?;
         }
-        let len = u32::try_from(body.bytes.len()).map_err(|_| Error::MalformedTable)?;
+        let len = u32::try_from(body.len()).map_err(|_| Error::MalformedTable)?;
+        let body = body.into_inner();
         self.write_u32(len);
-        self.write_bytes(&body.bytes);
+        self.write_bytes(&body);
         Ok(())
     }
 
@@ -314,9 +315,10 @@ impl Writer {
         for value in values {
             value.encode(&mut body, depth)?;
         }
-        let len = u32::try_from(body.bytes.len()).map_err(|_| Error::MalformedTable)?;
+        let len = u32::try_from(body.len()).map_err(|_| Error::MalformedTable)?;
+        let body = body.into_inner();
         self.write_u32(len);
-        self.write_bytes(&body.bytes);
+        self.write_bytes(&body);
         Ok(())
     }
 }
