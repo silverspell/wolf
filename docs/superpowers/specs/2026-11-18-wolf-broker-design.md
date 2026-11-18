@@ -325,9 +325,9 @@ Kabul kriterleri: agent'ların doğrulayacakları (CI/devcontainer, yalnızca Ru
 Not: Varsayılan `guest/guest` kullanıcısı RabbitMQ uyumluluğu için bilinçli
 olarak var ve RabbitMQ'daki gibi yalnızca loopback'ten bağlanabilir. Semgrep
 `loopflow-rust-hardcoded-secret-or-insecure-tls` kuralı bunu yakalarsa,
-değişkeni yeniden adlandırarak kuralın etrafından dolaşılmaz. Bunun yerine o
-satıra `// nosemgrep: loopflow-rust-hardcoded-secret-or-insecure-tls` ve
-gerekçesi eklenir.
+agent'lar ne değişkeni yeniden adlandırır ne de `nosemgrep` ekler. Bulgu ekibe
+iletilir ve ekip karar verir. Olası çözüm, varsayılan kimlik bilgilerinin
+env'den okunmasıdır.
 
 ## 10. Değerlendirilen yaklaşımlar
 
