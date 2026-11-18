@@ -18,7 +18,7 @@ use wolf_broker::{
     PublishOutcome, PublishRequest, Vhost, VhostName,
 };
 
-use crate::amqp::auth::{self, AuthError};
+use crate::amqp::auth::{self, Account, AuthError};
 use crate::amqp::basic_publish::{CompletedPublish, PendingPublish};
 use crate::amqp::channel::Channel;
 use crate::amqp::confirm::ConfirmState;
@@ -64,6 +64,7 @@ pub struct Connection {
     state: State,
     peer: SocketAddr,
     broker: Arc<Broker>,
+    account: Arc<Account>,
     broker_connection: BrokerConnectionId,
     channels: BTreeMap<u16, Channel>,
     channel_max: u16,
@@ -78,8 +79,8 @@ pub struct Connection {
 
 impl Connection {
     /// Creates a connection in the initial handshake state.
-    pub fn new(peer: SocketAddr, broker: Arc<Broker>) -> Self {
-        Self::with_connection_id(peer, broker, BrokerConnectionId::new(0))
+    pub fn new(peer: SocketAddr, broker: Arc<Broker>, account: Arc<Account>) -> Self {
+        Self::with_connection_id(peer, broker, account, BrokerConnectionId::new(0))
     }
 
     /// Creates a connection with the broker-side connection identifier used
@@ -87,17 +88,19 @@ impl Connection {
     pub fn with_connection_id(
         peer: SocketAddr,
         broker: Arc<Broker>,
+        account: Arc<Account>,
         broker_connection: BrokerConnectionId,
     ) -> Self {
         let hub = Arc::new(DeliveryHub::new());
         let (outbox, _receiver) = hub.subscribe();
-        Self::with_delivery(peer, broker, broker_connection, hub, outbox)
+        Self::with_delivery(peer, broker, account, broker_connection, hub, outbox)
     }
 
     /// Creates a connection that routes deliveries through a shared hub.
     pub fn with_delivery(
         peer: SocketAddr,
         broker: Arc<Broker>,
+        account: Arc<Account>,
         broker_connection: BrokerConnectionId,
         hub: Arc<DeliveryHub>,
         outbox: UnboundedSender<ServerEvent>,
@@ -106,6 +109,7 @@ impl Connection {
             state: State::AwaitingStartOk,
             peer,
             broker,
+            account,
             broker_connection,
             channels: BTreeMap::new(),
             channel_max: DEFAULT_CHANNEL_MAX,
@@ -294,8 +298,13 @@ impl Connection {
     }
 
     fn handle_start_ok(&mut self, start_ok: StartOk) -> Result<Vec<Frame>, AmqpError> {
-        auth::authenticate_long_string(start_ok.mechanism.as_str(), &start_ok.response, self.peer)
-            .map_err(AuthError::into_amqp)?;
+        auth::authenticate_long_string(
+            start_ok.mechanism.as_str(),
+            &start_ok.response,
+            self.peer,
+            &self.account,
+        )
+        .map_err(AuthError::into_amqp)?;
         self.state = State::AwaitingTuneOk;
         Ok(vec![self.tune_frame()])
     }
@@ -1083,6 +1092,7 @@ mod tests {
         Connection::new(
             "127.0.0.1:1234".parse().expect("valid address"),
             test_broker(),
+            Arc::new(Account::guest()),
         )
     }
 

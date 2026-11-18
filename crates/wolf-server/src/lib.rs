@@ -11,5 +11,6 @@ pub mod delivery;
 pub mod listener;
 pub mod session;
 
-pub use config::ServerConfig;
+pub use amqp::auth::Account;
+pub use config::{ConfigError, ServerConfig};
 pub use listener::{ShutdownError, ShutdownHandle, start};

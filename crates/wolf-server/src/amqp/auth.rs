@@ -1,9 +1,10 @@
 //! SASL PLAIN authentication and the loopback-only guest policy.
 //!
-//! Wolf intentionally ships a single built-in `guest`/`guest` credential for
-//! RabbitMQ compatibility. Like RabbitMQ, the guest account may only connect
-//! from a loopback address.
+//! Wolf ships a built-in `guest`/`guest` credential for RabbitMQ compatibility;
+//! deployments may override it through [`crate::config`]. Like RabbitMQ, the
+//! guest account may only connect from a loopback address.
 
+use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 
 use wolf_amqp_codec::LongString;
@@ -13,7 +14,58 @@ use crate::amqp::error::{AmqpError, ReplyCode};
 /// The built-in RabbitMQ-compatible user name.
 const GUEST_USER: &str = "guest";
 /// The built-in RabbitMQ-compatible password.
-const GUEST_PASSWORD: &str = "guest";
+///
+/// This is the loopback-restricted default account kept for RabbitMQ
+/// compatibility; the suppression below is deliberately limited to this line.
+const GUEST_PASSWORD: &str = "guest"; // nosemgrep: loopflow-rust-hardcoded-secret-or-insecure-tls -- loopback-restricted default account for RabbitMQ compatibility (WOLF-22)
+
+/// A configured user account.
+///
+/// The password is private and redacted from [`fmt::Debug`] output.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Account {
+    username: String,
+    password: String,
+}
+
+impl Account {
+    /// Creates an account from a user name and password.
+    pub fn new(username: impl Into<String>, password: impl Into<String>) -> Self {
+        Self {
+            username: username.into(),
+            password: password.into(),
+        }
+    }
+
+    /// Returns the built-in RabbitMQ-compatible guest account.
+    pub fn guest() -> Self {
+        Self::new(GUEST_USER, GUEST_PASSWORD)
+    }
+
+    /// Returns the account's user name.
+    pub fn username(&self) -> &str {
+        &self.username
+    }
+
+    fn matches(&self, credentials: &Credentials) -> bool {
+        self.username == credentials.username && self.password == credentials.password
+    }
+}
+
+impl Default for Account {
+    fn default() -> Self {
+        Self::guest()
+    }
+}
+
+impl fmt::Debug for Account {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Account")
+            .field("username", &self.username)
+            .field("password", &"redacted")
+            .finish()
+    }
+}
 
 /// Credentials extracted from a SASL PLAIN response.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,20 +116,22 @@ impl From<AuthError> for AmqpError {
 
 /// Authenticates a client using the selected mechanism and response bytes.
 ///
-/// Only `PLAIN` is supported and only the built-in guest account is accepted.
+/// Only `PLAIN` is supported. Credentials are compared against the configured
+/// account, and the `guest` user is additionally restricted to loopback peers.
 pub fn authenticate(
     mechanism: &str,
     response: &[u8],
     peer: SocketAddr,
+    account: &Account,
 ) -> Result<Credentials, AuthError> {
     if mechanism != "PLAIN" {
         return Err(AuthError::UnsupportedMechanism(mechanism.to_string()));
     }
     let credentials = parse_plain_response(response)?;
-    if credentials.username != GUEST_USER || credentials.password != GUEST_PASSWORD {
+    if !account.matches(&credentials) {
         return Err(AuthError::InvalidCredentials);
     }
-    if !is_loopback(peer.ip()) {
+    if credentials.username == GUEST_USER && !is_loopback(peer.ip()) {
         return Err(AuthError::GuestFromNonLoopback);
     }
     Ok(credentials)
@@ -126,8 +180,9 @@ pub fn authenticate_long_string(
     mechanism: &str,
     response: &LongString,
     peer: SocketAddr,
+    account: &Account,
 ) -> Result<Credentials, AuthError> {
-    authenticate(mechanism, response.as_bytes(), peer)
+    authenticate(mechanism, response.as_bytes(), peer, account)
 }
 
 #[cfg(test)]
@@ -138,6 +193,10 @@ mod tests {
 
     fn peer(address: &str) -> SocketAddr {
         address.parse().expect("valid socket address")
+    }
+
+    fn guest() -> Account {
+        Account::guest()
     }
 
     #[test]
@@ -177,16 +236,28 @@ mod tests {
     }
 
     #[test]
+    fn account_defaults_to_the_guest_credentials() {
+        assert_eq!(Account::default(), Account::guest());
+        assert_eq!(Account::default().username(), "guest");
+    }
+
+    #[test]
     fn guest_authenticates_from_loopback() {
-        let credentials = authenticate("PLAIN", b"\0guest\0guest", peer("127.0.0.1:1234"))
-            .expect("loopback guest is allowed");
+        let credentials =
+            authenticate("PLAIN", b"\0guest\0guest", peer("127.0.0.1:1234"), &guest())
+                .expect("loopback guest is allowed");
         assert_eq!(credentials.username, "guest");
     }
 
     #[test]
     fn guest_is_rejected_from_non_loopback() {
-        let error = authenticate("PLAIN", b"\0guest\0guest", peer("192.0.2.10:1234"))
-            .expect_err("non-loopback guest must be rejected");
+        let error = authenticate(
+            "PLAIN",
+            b"\0guest\0guest",
+            peer("192.0.2.10:1234"),
+            &guest(),
+        )
+        .expect_err("non-loopback guest must be rejected");
         assert_eq!(error, AuthError::GuestFromNonLoopback);
         let amqp = error.into_amqp();
         assert_eq!(amqp.reply_code, ReplyCode::AccessRefused);
@@ -194,14 +265,48 @@ mod tests {
     }
 
     #[test]
-    fn unknown_credentials_and_mechanisms_are_rejected() {
+    fn configured_user_is_not_loopback_restricted() {
+        let account = Account::new("alice", "s3cret");
+        let credentials = authenticate(
+            "PLAIN",
+            b"\0alice\0s3cret",
+            peer("192.0.2.10:1234"),
+            &account,
+        )
+        .expect("configured users may connect from any peer");
+        assert_eq!(credentials.username, "alice");
+    }
+
+    #[test]
+    fn configured_user_rejects_wrong_password() {
+        let account = Account::new("alice", "s3cret");
         assert_eq!(
-            authenticate("PLAIN", b"\0guest\0wrong", peer("127.0.0.1:1")),
+            authenticate("PLAIN", b"\0alice\0wrong", peer("127.0.0.1:1"), &account),
             Err(AuthError::InvalidCredentials)
         );
         assert_eq!(
-            authenticate("AMQPLAIN", b"\0guest\0guest", peer("127.0.0.1:1")),
+            authenticate("PLAIN", b"\0guest\0guest", peer("127.0.0.1:1"), &account),
+            Err(AuthError::InvalidCredentials)
+        );
+    }
+
+    #[test]
+    fn unknown_credentials_and_mechanisms_are_rejected() {
+        assert_eq!(
+            authenticate("PLAIN", b"\0guest\0wrong", peer("127.0.0.1:1"), &guest()),
+            Err(AuthError::InvalidCredentials)
+        );
+        assert_eq!(
+            authenticate("AMQPLAIN", b"\0guest\0guest", peer("127.0.0.1:1"), &guest()),
             Err(AuthError::UnsupportedMechanism("AMQPLAIN".to_string()))
         );
+    }
+
+    #[test]
+    fn debug_redacts_the_password() {
+        let rendered = format!("{:?}", Account::new("alice", "s3cret"));
+        assert!(rendered.contains("alice"));
+        assert!(!rendered.contains("s3cret"));
+        assert!(rendered.contains("redacted"));
     }
 }

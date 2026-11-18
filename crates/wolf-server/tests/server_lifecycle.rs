@@ -56,3 +56,17 @@ async fn accepted_connection_creates_a_session() {
         "listener must be closed after shutdown"
     );
 }
+
+#[test]
+fn binary_refuses_to_start_when_only_one_credential_variable_is_set() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_wolf"))
+        .env("WOLF_DEFAULT_USER", "alice")
+        .env_remove("WOLF_DEFAULT_PASS")
+        .output()
+        .expect("wolf binary runs");
+
+    assert!(!output.status.success(), "startup must fail");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("WOLF_DEFAULT_USER"), "stderr: {stderr}");
+    assert!(stderr.contains("WOLF_DEFAULT_PASS"), "stderr: {stderr}");
+}

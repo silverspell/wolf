@@ -323,11 +323,20 @@ Kabul kriterleri: agent'ların doğrulayacakları (CI/devcontainer, yalnızca Ru
    throughput hedefi yok, sadece sonuç kaydedilir.
 
 Not: Varsayılan `guest/guest` kullanıcısı RabbitMQ uyumluluğu için bilinçli
-olarak var ve RabbitMQ'daki gibi yalnızca loopback'ten bağlanabilir. Semgrep
-`loopflow-rust-hardcoded-secret-or-insecure-tls` kuralı bunu yakalarsa,
-agent'lar ne değişkeni yeniden adlandırır ne de `nosemgrep` ekler. Bulgu ekibe
-iletilir ve ekip karar verir. Olası çözüm, varsayılan kimlik bilgilerinin
-env'den okunmasıdır.
+olarak var ve RabbitMQ'daki gibi yalnızca loopback'ten (`127.0.0.0/8`, `::1`)
+bağlanabilir. Kimlik bilgileri artık `ServerConfig` üzerinden dışarıdan
+verilebilir; `WOLF_DEFAULT_USER` ve `WOLF_DEFAULT_PASS` ortam değişkenleri
+ikisi birlikte ayarlandığında varsayılan hesabın yerine geçer. İkisinden
+yalnızca biri ayarlıysa sunucu net bir hata ile başlamayı reddeder. Env ile
+tanımlanan `guest` dışı bir kullanıcı loopback kısıtına tabi değildir; parola
+karşılaştırması tek yerde (`auth.rs`) kalır ve parolalar asla loglanmaz.
+
+Semgrep `loopflow-rust-hardcoded-secret-or-insecure-tls` kuralı, varsayılan
+guest parolasının env yokken kaynakta kalması nedeniyle yalnızca o tek satırda
+(WOLF-22), gerekçeli bir `nosemgrep` yorumuyla bastırılır. Bu istisna yalnızca
+loopback ile sınırlandırılmış, RabbitMQ uyumluluğu için tutulan varsayılan
+hesap içindir; değişken yeniden adlandırılmaz, değer bölünmez ve dosya/blok
+seviyesinde bastırma yapılmaz.
 
 ## 10. Değerlendirilen yaklaşımlar
 

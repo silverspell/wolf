@@ -3,9 +3,10 @@
 mod support;
 
 use wolf_amqp_codec::{ChannelFlow, ChannelMethod, FieldValue, Frame, Method, ShortString};
+use wolf_server::Account;
 use wolf_server::amqp::connection::DEFAULT_HEARTBEAT;
 
-use support::{TestClient, start_server};
+use support::{TestClient, config, start_server};
 
 fn capabilities(start: &wolf_amqp_codec::Start) -> &wolf_amqp_codec::FieldTable {
     match start.server_properties.get("capabilities") {
@@ -168,6 +169,46 @@ async fn channel_flow_true_replies_and_false_closes_the_connection() {
     let close = client.expect_connection_close().await;
     assert_eq!(close.reply_code, 540);
     assert_eq!((close.class_id, close.method_id), (20, 20));
+
+    drop(client);
+    handle.shutdown().await.expect("graceful shutdown");
+}
+
+#[tokio::test]
+async fn configured_credentials_authenticate_from_loopback() {
+    let mut config = config();
+    config.account = Account::new("alice", "s3cret");
+    let (addr, handle) = wolf_server::start(config).await.expect("server starts");
+
+    let mut client = TestClient::connect(addr).await;
+    let _ = client.begin().await;
+    client.send_start_ok("alice", "s3cret").await;
+    let tune = client.read_tune().await;
+    assert_eq!(tune.channel_max, 2047);
+
+    client.send_tune_ok(0, 0, 0).await;
+    client.send_open("/").await;
+    client.read_open_ok().await;
+    let _ = client.open_channel(1).await;
+    client.close_channel(1).await;
+
+    drop(client);
+    handle.shutdown().await.expect("graceful shutdown");
+}
+
+#[tokio::test]
+async fn configured_user_with_wrong_password_is_rejected_with_403() {
+    let mut config = config();
+    config.account = Account::new("alice", "s3cret");
+    let (addr, handle) = wolf_server::start(config).await.expect("server starts");
+
+    let mut client = TestClient::connect(addr).await;
+    let _ = client.begin().await;
+    client.send_start_ok("alice", "wrong").await;
+
+    let close = client.expect_connection_close().await;
+    assert_eq!(close.reply_code, 403);
+    assert_eq!((close.class_id, close.method_id), (10, 11));
 
     drop(client);
     handle.shutdown().await.expect("graceful shutdown");
