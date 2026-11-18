@@ -16,6 +16,7 @@ pub mod queue;
 pub mod router;
 pub mod stream;
 pub mod topic;
+pub mod validation;
 pub mod vhost;
 
 pub use binding::{Binding, QueueName};
@@ -31,4 +32,5 @@ pub use exchange::{
 };
 pub use message::Message;
 pub use topic::{RoutingKey, TopicPattern, TopicTrie};
+pub use validation::{QueueArguments, UNSUPPORTED_QUEUE_ARGUMENTS, validate_queue_arguments};
 pub use vhost::{Vhost, VhostId, VhostName};
