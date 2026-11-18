@@ -25,8 +25,8 @@ pub use binding::{Binding, QueueName};
 pub use broker::Broker;
 pub use consumer::{ConsumerDispatcher, ConsumerOptions, SettleOutcome};
 pub use delivery::{
-    CancelReason, ChannelId, ConsumerCancel, ConsumerId, CreditReceiver, CreditSignal, Delivery,
-    DeliverySink, DeliveryTag,
+    CancelReason, ChannelId, ConsumerCancel, ConsumerId, CreditReceiver, CreditSignal,
+    DeliverOutcome, Delivery, DeliverySink, DeliveryTag,
 };
 pub use error::{DomainError, ResourceKind};
 pub use exchange::{

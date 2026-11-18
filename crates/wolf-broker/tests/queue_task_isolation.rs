@@ -1,13 +1,13 @@
-use std::sync::{Arc, Barrier};
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use tokio::sync::oneshot;
+use tokio::sync::{Barrier, oneshot};
 use tokio::time::timeout;
 use wolf_broker::queue::ConnectionId;
 use wolf_broker::{
-    ChannelId, ConsumerCancel, ConsumerId, ConsumerOptions, Delivery, DeliverySink, Message,
-    PublishRequest, QueueConfig, Vhost, VhostId, VhostName,
+    ChannelId, ConsumerCancel, ConsumerId, ConsumerOptions, DeliverOutcome, Delivery, DeliverySink,
+    Message, PublishRequest, QueueConfig, Vhost, VhostId, VhostName,
 };
 
 const SAFETY: Duration = Duration::from_secs(10);
@@ -19,17 +19,20 @@ struct BlockingSink {
 }
 
 impl DeliverySink for BlockingSink {
-    fn deliver(&mut self, delivery: Delivery) {
+    async fn deliver(&mut self, delivery: Delivery) -> DeliverOutcome {
         if let Some(entered) = self.entered.take() {
             let _ = entered.send(());
         }
-        self.barrier.wait();
+        self.barrier.wait().await;
         if let Some(delivered) = self.delivered.take() {
             let _ = delivered.send(delivery);
         }
+        DeliverOutcome::Delivered
     }
 
-    fn cancel(&mut self, _cancel: ConsumerCancel) {}
+    fn cancel(&mut self, _cancel: ConsumerCancel) -> impl Future<Output = ()> + Send {
+        std::future::ready(())
+    }
 }
 
 struct SignalSink {
@@ -37,13 +40,16 @@ struct SignalSink {
 }
 
 impl DeliverySink for SignalSink {
-    fn deliver(&mut self, delivery: Delivery) {
+    async fn deliver(&mut self, delivery: Delivery) -> DeliverOutcome {
         if let Some(delivered) = self.delivered.take() {
             let _ = delivered.send(delivery);
         }
+        DeliverOutcome::Delivered
     }
 
-    fn cancel(&mut self, _cancel: ConsumerCancel) {}
+    fn cancel(&mut self, _cancel: ConsumerCancel) -> impl Future<Output = ()> + Send {
+        std::future::ready(())
+    }
 }
 
 fn message(body: &'static [u8]) -> Message {
@@ -149,7 +155,7 @@ async fn a_blocked_delivery_does_not_block_another_queue_or_router_reads() {
         "A must still be blocked at the barrier when B completes"
     );
 
-    barrier.wait();
+    barrier.wait().await;
 
     let delivered_a = timeout(SAFETY, a_delivered_rx)
         .await

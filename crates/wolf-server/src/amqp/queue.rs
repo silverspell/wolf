@@ -165,7 +165,7 @@ pub async fn delete_with_hub(
     let mut frames = Vec::new();
     for cancel in outcome.cancels {
         let Some(entry) = consumers.remove(cancel.consumer) else {
-            hub.cancel(cancel);
+            hub.cancel(cancel).await;
             continue;
         };
         hub.unregister(cancel.consumer);

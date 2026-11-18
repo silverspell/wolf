@@ -98,7 +98,7 @@ pub async fn start(config: ServerConfig) -> io::Result<(SocketAddr, ShutdownHand
     let (sender, receiver) = watch::channel(false);
     let active_sessions = Arc::new(AtomicUsize::new(0));
     let session_count = Arc::clone(&active_sessions);
-    let hub = Arc::new(DeliveryHub::new());
+    let hub = Arc::new(DeliveryHub::with_capacity(config.outbox_capacity));
     let account = Arc::new(config.account.clone());
 
     let task = tokio::spawn(accept_loop(
@@ -252,6 +252,7 @@ async fn run_session(
         }
     }
 
+    drop(outbox_rx);
     session.shutdown().await;
     drain_before_close(&mut stream).await;
     let _ = stream.shutdown().await;

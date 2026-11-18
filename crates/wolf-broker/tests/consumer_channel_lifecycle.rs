@@ -1,8 +1,10 @@
+use std::future::Future;
+
 use bytes::Bytes;
 use wolf_broker::queue::{ConnectionId, QueueConfig, QueueRegistry};
 use wolf_broker::{
     CancelReason, ChannelId, ConsumerCancel, ConsumerDispatcher, ConsumerId, ConsumerOptions,
-    Delivery, DeliverySink, Message, MessageMetadata, Vhost, VhostId, VhostName,
+    DeliverOutcome, Delivery, DeliverySink, Message, MessageMetadata, Vhost, VhostId, VhostName,
 };
 
 #[derive(Debug, Default, Clone)]
@@ -12,12 +14,14 @@ struct RecordingSink {
 }
 
 impl DeliverySink for RecordingSink {
-    fn deliver(&mut self, delivery: Delivery) {
+    fn deliver(&mut self, delivery: Delivery) -> impl Future<Output = DeliverOutcome> + Send {
         self.deliveries.push(delivery);
+        std::future::ready(DeliverOutcome::Delivered)
     }
 
-    fn cancel(&mut self, cancel: ConsumerCancel) {
+    fn cancel(&mut self, cancel: ConsumerCancel) -> impl Future<Output = ()> + Send {
         self.cancels.push(cancel);
+        std::future::ready(())
     }
 }
 
@@ -34,8 +38,8 @@ fn bodies(queues: &QueueRegistry, queue: &str) -> Vec<Bytes> {
         .collect()
 }
 
-#[test]
-fn message_metadata_is_optional_and_shared_across_clones() {
+#[tokio::test]
+async fn message_metadata_is_optional_and_shared_across_clones() {
     let body = Bytes::from_static(b"payload");
     let properties = Bytes::from_static(b"\x80\x00");
     let message = Message::with_metadata(
@@ -59,8 +63,8 @@ fn message_metadata_is_optional_and_shared_across_clones() {
     assert!(plain.metadata().is_none());
 }
 
-#[test]
-fn no_ack_dispatch_does_not_track_or_consume_prefetch_credit() {
+#[tokio::test]
+async fn no_ack_dispatch_does_not_track_or_consume_prefetch_credit() {
     let mut queues = QueueRegistry::new();
     let mut dispatcher = ConsumerDispatcher::new();
     let connection = ConnectionId::new(1);
@@ -90,6 +94,7 @@ fn no_ack_dispatch_does_not_track_or_consume_prefetch_credit() {
     assert_eq!(
         dispatcher
             .dispatch(&mut queues, "jobs", &mut sink)
+            .await
             .expect("dispatch"),
         3
     );
@@ -98,8 +103,8 @@ fn no_ack_dispatch_does_not_track_or_consume_prefetch_credit() {
     assert_eq!(queues.queue("jobs").expect("queue").message_count(), 0);
 }
 
-#[test]
-fn get_allocates_delivery_tags_and_tracks_unacked_unless_no_ack() {
+#[tokio::test]
+async fn get_allocates_delivery_tags_and_tracks_unacked_unless_no_ack() {
     let mut queues = QueueRegistry::new();
     let mut dispatcher = ConsumerDispatcher::new();
     let connection = ConnectionId::new(1);
@@ -142,8 +147,8 @@ fn get_allocates_delivery_tags_and_tracks_unacked_unless_no_ack() {
     assert_eq!(empty, wolf_broker::GetOutcome::Empty);
 }
 
-#[test]
-fn cancel_removes_the_consumer_and_suppresses_delivery() {
+#[tokio::test]
+async fn cancel_removes_the_consumer_and_suppresses_delivery() {
     let mut queues = QueueRegistry::new();
     let mut dispatcher = ConsumerDispatcher::new();
     let connection = ConnectionId::new(1);
@@ -171,6 +176,7 @@ fn cancel_removes_the_consumer_and_suppresses_delivery() {
     assert_eq!(
         dispatcher
             .dispatch(&mut queues, "jobs", &mut sink)
+            .await
             .expect("dispatch"),
         0
     );
@@ -178,8 +184,8 @@ fn cancel_removes_the_consumer_and_suppresses_delivery() {
     assert_eq!(queues.queue("jobs").expect("queue").message_count(), 1);
 }
 
-#[test]
-fn close_channel_requeues_unacked_with_redelivered_and_removes_consumers() {
+#[tokio::test]
+async fn close_channel_requeues_unacked_with_redelivered_and_removes_consumers() {
     let mut queues = QueueRegistry::new();
     let mut dispatcher = ConsumerDispatcher::new();
     let connection = ConnectionId::new(1);
@@ -201,6 +207,7 @@ fn close_channel_requeues_unacked_with_redelivered_and_removes_consumers() {
     assert_eq!(
         dispatcher
             .dispatch(&mut queues, "jobs", &mut sink)
+            .await
             .expect("dispatch"),
         2
     );
@@ -230,12 +237,13 @@ fn close_channel_requeues_unacked_with_redelivered_and_removes_consumers() {
     sink.deliveries.clear();
     dispatcher
         .dispatch(&mut queues, "jobs", &mut sink)
+        .await
         .expect("redispatch");
     assert!(sink.deliveries.iter().all(|delivery| delivery.redelivered));
 }
 
-#[test]
-fn close_connection_requeues_basic_get_unacked_as_well() {
+#[tokio::test]
+async fn close_connection_requeues_basic_get_unacked_as_well() {
     let mut queues = QueueRegistry::new();
     let mut dispatcher = ConsumerDispatcher::new();
     let connection = ConnectionId::new(1);

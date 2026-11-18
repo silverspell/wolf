@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::Sender;
 use wolf_amqp_codec::{
     BasicAck, BasicCancel, BasicConsume, BasicGet, BasicMethod, BasicNack, BasicPublish, BasicQos,
     BasicRecover, BasicRecoverAsync, BasicReject, ChannelCloseOk, ChannelFlowOk, ChannelMethod,
@@ -73,7 +73,7 @@ pub struct Connection {
     vhost: Option<VhostName>,
     consumers: ConsumerDirectory,
     hub: Arc<DeliveryHub>,
-    outbox: UnboundedSender<ServerEvent>,
+    outbox: Sender<ServerEvent>,
     cleaned: bool,
 }
 
@@ -103,7 +103,7 @@ impl Connection {
         account: Arc<Account>,
         broker_connection: BrokerConnectionId,
         hub: Arc<DeliveryHub>,
-        outbox: UnboundedSender<ServerEvent>,
+        outbox: Sender<ServerEvent>,
     ) -> Self {
         Self {
             state: State::AwaitingStartOk,
@@ -696,9 +696,11 @@ impl Connection {
             PublishOutcome::Routed { .. } | PublishOutcome::Dropped => Vec::new(),
         };
 
-        vhost.dispatch_all(self.hub.sink()).await.map_err(|error| {
-            AmqpError::from_domain(&error).with_offending(basic::CLASS_ID, basic::PUBLISH)
-        })?;
+        vhost
+            .dispatch_all_detached(self.hub.sink())
+            .map_err(|error| {
+                AmqpError::from_domain(&error).with_offending(basic::CLASS_ID, basic::PUBLISH)
+            })?;
 
         if let Some(channel) = self.channels.get_mut(&frame_channel) {
             channel.pending_publish = None;
@@ -932,7 +934,7 @@ impl Connection {
             for (consumer, _) in self.consumers.remove_channel(frame_channel) {
                 self.hub.unregister(consumer);
             }
-            let _ = vhost.dispatch_all(self.hub.sink()).await;
+            let _ = vhost.dispatch_all_detached(self.hub.sink());
         } else {
             for (consumer, _) in self.consumers.remove_channel(frame_channel) {
                 self.hub.unregister(consumer);
@@ -951,7 +953,7 @@ impl Connection {
             let broker = Arc::clone(&self.broker);
             if let Ok(vhost) = broker.vhost(&name) {
                 let _ = vhost.close_connection(self.broker_connection).await;
-                let _ = vhost.dispatch_all(self.hub.sink()).await;
+                let _ = vhost.dispatch_all_detached(self.hub.sink());
             }
         }
         for (consumer, _) in self.consumers.drain() {

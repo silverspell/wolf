@@ -1,7 +1,9 @@
+use std::future::Future;
+
 use bytes::Bytes;
 use wolf_broker::{
-    CancelReason, ChannelId, ConsumerCancel, ConsumerId, CreditSignal, Delivery, DeliverySink,
-    DeliveryTag, Message,
+    CancelReason, ChannelId, ConsumerCancel, ConsumerId, CreditSignal, DeliverOutcome, Delivery,
+    DeliverySink, DeliveryTag, Message,
 };
 
 #[derive(Debug, Default)]
@@ -11,17 +13,19 @@ struct RecordingSink {
 }
 
 impl DeliverySink for RecordingSink {
-    fn deliver(&mut self, delivery: Delivery) {
+    fn deliver(&mut self, delivery: Delivery) -> impl Future<Output = DeliverOutcome> + Send {
         self.deliveries.push(delivery);
+        std::future::ready(DeliverOutcome::Delivered)
     }
 
-    fn cancel(&mut self, cancel: ConsumerCancel) {
+    fn cancel(&mut self, cancel: ConsumerCancel) -> impl Future<Output = ()> + Send {
         self.cancels.push(cancel);
+        std::future::ready(())
     }
 }
 
-#[test]
-fn delivery_contract_forwards_message_metadata() {
+#[tokio::test]
+async fn delivery_contract_forwards_message_metadata() {
     let body = Bytes::from_static(b"payload");
     let ptr = body.as_ptr();
 
@@ -33,7 +37,7 @@ fn delivery_contract_forwards_message_metadata() {
     };
 
     let mut sink = RecordingSink::default();
-    sink.deliver(delivery.clone());
+    sink.deliver(delivery.clone()).await;
 
     assert_eq!(sink.deliveries.len(), 1);
     let recorded = &sink.deliveries[0];
@@ -72,15 +76,15 @@ fn credit_contract_covers_consumer_and_channel_scopes() {
     }
 }
 
-#[test]
-fn cancel_contract_is_protocol_neutral() {
+#[tokio::test]
+async fn cancel_contract_is_protocol_neutral() {
     let cancel = ConsumerCancel {
         consumer: ConsumerId::new(9),
         reason: CancelReason::QueueDeleted,
     };
 
     let mut sink = RecordingSink::default();
-    sink.cancel(cancel.clone());
+    sink.cancel(cancel.clone()).await;
 
     assert_eq!(sink.cancels, vec![cancel]);
     assert_eq!(sink.cancels[0].consumer, ConsumerId::new(9));

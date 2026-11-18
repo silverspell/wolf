@@ -1,8 +1,10 @@
+use std::future::Future;
+
 use bytes::Bytes;
 use wolf_broker::queue::{ConnectionId, QueueConfig, QueueRegistry};
 use wolf_broker::{
     CancelReason, ChannelId, ConsumerCancel, ConsumerDispatcher, ConsumerId, CreditSignal,
-    Delivery, DeliverySink, DeliveryTag, DomainError, Message,
+    DeliverOutcome, Delivery, DeliverySink, DeliveryTag, DomainError, Message,
 };
 
 #[derive(Debug, Default)]
@@ -12,12 +14,14 @@ struct RecordingSink {
 }
 
 impl DeliverySink for RecordingSink {
-    fn deliver(&mut self, delivery: Delivery) {
+    fn deliver(&mut self, delivery: Delivery) -> impl Future<Output = DeliverOutcome> + Send {
         self.deliveries.push(delivery);
+        std::future::ready(DeliverOutcome::Delivered)
     }
 
-    fn cancel(&mut self, cancel: ConsumerCancel) {
+    fn cancel(&mut self, cancel: ConsumerCancel) -> impl Future<Output = ()> + Send {
         self.cancels.push(cancel);
+        std::future::ready(())
     }
 }
 
@@ -75,8 +79,8 @@ fn delivered_bodies(sink: &RecordingSink) -> Vec<Bytes> {
         .collect()
 }
 
-#[test]
-fn ack_multiple_acknowledges_all_tags_up_to_cut() {
+#[tokio::test]
+async fn ack_multiple_acknowledges_all_tags_up_to_cut() {
     let (mut queues, mut dispatcher, connection, channel, consumer) = setup(3);
     publish(&mut queues, connection, &["m1", "m2", "m3"]);
 
@@ -84,6 +88,7 @@ fn ack_multiple_acknowledges_all_tags_up_to_cut() {
     assert_eq!(
         dispatcher
             .dispatch(&mut queues, "jobs", &mut sink)
+            .await
             .expect("dispatch"),
         3
     );
@@ -106,8 +111,8 @@ fn ack_multiple_acknowledges_all_tags_up_to_cut() {
     assert_eq!(queues.queue("jobs").expect("queue").message_count(), 0);
 }
 
-#[test]
-fn ack_single_leaves_other_deliveries_unacked() {
+#[tokio::test]
+async fn ack_single_leaves_other_deliveries_unacked() {
     let (mut queues, mut dispatcher, connection, channel, _consumer) = setup(3);
     publish(&mut queues, connection, &["m1", "m2", "m3"]);
 
@@ -115,6 +120,7 @@ fn ack_single_leaves_other_deliveries_unacked() {
     assert_eq!(
         dispatcher
             .dispatch(&mut queues, "jobs", &mut sink)
+            .await
             .expect("dispatch"),
         3
     );
@@ -130,8 +136,8 @@ fn ack_single_leaves_other_deliveries_unacked() {
     assert_eq!(queues.queue("jobs").expect("queue").message_count(), 0);
 }
 
-#[test]
-fn ack_restores_prefetch_credit() {
+#[tokio::test]
+async fn ack_restores_prefetch_credit() {
     let (mut queues, mut dispatcher, connection, channel, consumer) = setup(1);
     publish(&mut queues, connection, &["m1", "m2"]);
 
@@ -139,6 +145,7 @@ fn ack_restores_prefetch_credit() {
     assert_eq!(
         dispatcher
             .dispatch(&mut queues, "jobs", &mut sink)
+            .await
             .expect("first dispatch"),
         1
     );
@@ -159,6 +166,7 @@ fn ack_restores_prefetch_credit() {
     assert_eq!(
         dispatcher
             .dispatch(&mut queues, "jobs", &mut sink)
+            .await
             .expect("second dispatch"),
         1
     );
@@ -166,8 +174,8 @@ fn ack_restores_prefetch_credit() {
     assert_eq!(queues.queue("jobs").expect("queue").message_count(), 0);
 }
 
-#[test]
-fn nack_multiple_with_requeue_requeues_in_order_with_redelivered() {
+#[tokio::test]
+async fn nack_multiple_with_requeue_requeues_in_order_with_redelivered() {
     let (mut queues, mut dispatcher, connection, channel, _consumer) = setup(3);
     publish(&mut queues, connection, &["m1", "m2", "m3"]);
 
@@ -175,6 +183,7 @@ fn nack_multiple_with_requeue_requeues_in_order_with_redelivered() {
     assert_eq!(
         dispatcher
             .dispatch(&mut queues, "jobs", &mut sink)
+            .await
             .expect("dispatch"),
         3
     );
@@ -200,6 +209,7 @@ fn nack_multiple_with_requeue_requeues_in_order_with_redelivered() {
     assert_eq!(
         dispatcher
             .dispatch(&mut queues, "jobs", &mut sink)
+            .await
             .expect("redispatch"),
         3
     );
@@ -214,8 +224,8 @@ fn nack_multiple_with_requeue_requeues_in_order_with_redelivered() {
     );
 }
 
-#[test]
-fn reject_with_requeue_requeues_one_with_redelivered() {
+#[tokio::test]
+async fn reject_with_requeue_requeues_one_with_redelivered() {
     let (mut queues, mut dispatcher, connection, channel, _consumer) = setup(2);
     publish(&mut queues, connection, &["m1", "m2"]);
 
@@ -223,6 +233,7 @@ fn reject_with_requeue_requeues_one_with_redelivered() {
     assert_eq!(
         dispatcher
             .dispatch(&mut queues, "jobs", &mut sink)
+            .await
             .expect("dispatch"),
         2
     );
@@ -241,6 +252,7 @@ fn reject_with_requeue_requeues_one_with_redelivered() {
     assert_eq!(
         dispatcher
             .dispatch(&mut queues, "jobs", &mut sink)
+            .await
             .expect("redispatch"),
         1
     );
@@ -248,8 +260,8 @@ fn reject_with_requeue_requeues_one_with_redelivered() {
     assert_eq!(sink.deliveries[0].message.body().as_ref(), b"m2");
 }
 
-#[test]
-fn reject_without_requeue_discards() {
+#[tokio::test]
+async fn reject_without_requeue_discards() {
     let (mut queues, mut dispatcher, connection, channel, _consumer) = setup(2);
     publish(&mut queues, connection, &["m1", "m2"]);
 
@@ -257,6 +269,7 @@ fn reject_without_requeue_discards() {
     assert_eq!(
         dispatcher
             .dispatch(&mut queues, "jobs", &mut sink)
+            .await
             .expect("dispatch"),
         2
     );
@@ -272,8 +285,8 @@ fn reject_without_requeue_discards() {
     assert_eq!(queues.queue("jobs").expect("queue").message_count(), 0);
 }
 
-#[test]
-fn unknown_delivery_tag_is_rejected() {
+#[tokio::test]
+async fn unknown_delivery_tag_is_rejected() {
     let (_queues, mut dispatcher, _connection, channel, _consumer) = setup(1);
 
     let error = dispatcher
@@ -284,8 +297,8 @@ fn unknown_delivery_tag_is_rejected() {
     assert_eq!(dispatcher.unacked_count(channel), 0);
 }
 
-#[test]
-fn connection_close_requeues_unacked_with_redelivered() {
+#[tokio::test]
+async fn connection_close_requeues_unacked_with_redelivered() {
     let (mut queues, mut dispatcher, connection, channel, _consumer) = setup(2);
     publish(&mut queues, connection, &["m1", "m2"]);
 
@@ -293,6 +306,7 @@ fn connection_close_requeues_unacked_with_redelivered() {
     assert_eq!(
         dispatcher
             .dispatch(&mut queues, "jobs", &mut sink)
+            .await
             .expect("dispatch"),
         2
     );
@@ -332,6 +346,7 @@ fn connection_close_requeues_unacked_with_redelivered() {
     assert_eq!(
         dispatcher
             .dispatch(&mut queues, "jobs", &mut sink)
+            .await
             .expect("redispatch"),
         2
     );
@@ -342,8 +357,8 @@ fn connection_close_requeues_unacked_with_redelivered() {
     );
 }
 
-#[test]
-fn connection_close_still_applies_queue_lifecycle() {
+#[tokio::test]
+async fn connection_close_still_applies_queue_lifecycle() {
     let mut queues = QueueRegistry::new();
     let mut dispatcher = ConsumerDispatcher::new();
     let connection = ConnectionId::new(1);
@@ -368,6 +383,7 @@ fn connection_close_still_applies_queue_lifecycle() {
     assert_eq!(
         dispatcher
             .dispatch(&mut queues, name.as_str(), &mut sink)
+            .await
             .expect("dispatch"),
         1
     );
@@ -386,8 +402,8 @@ fn connection_close_still_applies_queue_lifecycle() {
     assert_eq!(dispatcher.unacked_count(channel), 0);
 }
 
-#[test]
-fn recover_requeues_all_unacked_with_redelivered() {
+#[tokio::test]
+async fn recover_requeues_all_unacked_with_redelivered() {
     let (mut queues, mut dispatcher, connection, channel, _consumer) = setup(3);
     publish(&mut queues, connection, &["m1", "m2", "m3"]);
 
@@ -395,6 +411,7 @@ fn recover_requeues_all_unacked_with_redelivered() {
     assert_eq!(
         dispatcher
             .dispatch(&mut queues, "jobs", &mut sink)
+            .await
             .expect("dispatch"),
         3
     );
@@ -417,6 +434,7 @@ fn recover_requeues_all_unacked_with_redelivered() {
     assert_eq!(
         dispatcher
             .dispatch(&mut queues, "jobs", &mut sink)
+            .await
             .expect("redispatch"),
         3
     );
