@@ -8,6 +8,7 @@
 
 pub mod binding;
 pub mod broker;
+pub mod consumer;
 pub mod delivery;
 pub mod error;
 pub mod exchange;
@@ -21,6 +22,7 @@ pub mod vhost;
 
 pub use binding::{Binding, QueueName};
 pub use broker::Broker;
+pub use consumer::{ConsumerDispatcher, SettleOutcome};
 pub use delivery::{
     CancelReason, ChannelId, ConsumerCancel, ConsumerId, CreditReceiver, CreditSignal, Delivery,
     DeliverySink, DeliveryTag,

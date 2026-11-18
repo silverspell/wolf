@@ -1,0 +1,542 @@
+//! Consumer registration, prefetch/credit accounting and settlement.
+//!
+//! Consumers are dispatched round-robin per queue while respecting per-consumer
+//! and channel-wide prefetch limits. Deliveries are tracked per channel so
+//! acknowledgement, rejection, recovery and connection close can requeue
+//! unacknowledged messages with the redelivered flag set.
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use crate::binding::QueueName;
+use crate::delivery::{ChannelId, ConsumerId, CreditSignal, Delivery, DeliverySink, DeliveryTag};
+use crate::error::DomainError;
+use crate::message::Message;
+use crate::queue::{ConnectionCloseOutcome, ConnectionId, Queue, QueueRegistry};
+
+#[derive(Debug, Clone)]
+struct ConsumerState {
+    connection: ConnectionId,
+    channel: ChannelId,
+    queue: QueueName,
+    inflight: u32,
+}
+
+#[derive(Debug)]
+struct ChannelState {
+    consumers: BTreeSet<ConsumerId>,
+    consumer_prefetch: u32,
+    channel_prefetch: u32,
+    next_tag: u64,
+    inflight: u32,
+    unacked: BTreeMap<DeliveryTag, Unacked>,
+}
+
+impl Default for ChannelState {
+    fn default() -> Self {
+        Self {
+            consumers: BTreeSet::new(),
+            consumer_prefetch: 0,
+            channel_prefetch: 0,
+            next_tag: 1,
+            inflight: 0,
+            unacked: BTreeMap::new(),
+        }
+    }
+}
+
+impl ChannelState {
+    fn allocate_tag(&mut self) -> DeliveryTag {
+        let tag = DeliveryTag::new(self.next_tag);
+        self.next_tag = self.next_tag.wrapping_add(1);
+        if self.next_tag == 0 {
+            self.next_tag = 1;
+        }
+        tag
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Unacked {
+    consumer: ConsumerId,
+    queue: QueueName,
+    message: Message,
+}
+
+/// The result of acknowledging, rejecting, recovering or requeueing deliveries.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SettleOutcome {
+    /// Number of unacknowledged deliveries removed from the channel.
+    pub settled: usize,
+    /// Number of messages returned to their queues.
+    pub requeued: usize,
+    /// Credit made available by settling the deliveries.
+    pub credit: Vec<CreditSignal>,
+}
+
+/// Tracks consumers and dispatches queue messages to them.
+#[derive(Debug, Default)]
+pub struct ConsumerDispatcher {
+    consumers: BTreeMap<ConsumerId, ConsumerState>,
+    channels: BTreeMap<ChannelId, ChannelState>,
+    cursors: BTreeMap<QueueName, ConsumerId>,
+}
+
+impl ConsumerDispatcher {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Registers a consumer on a queue.
+    ///
+    /// Queue membership remains owned by [`QueueRegistry`]; this only records
+    /// the channel, connection and prefetch state needed for dispatch.
+    pub fn register(
+        &mut self,
+        queues: &mut QueueRegistry,
+        connection: ConnectionId,
+        channel: ChannelId,
+        consumer: ConsumerId,
+        queue: impl AsRef<str>,
+    ) -> Result<(), DomainError> {
+        if self.consumers.contains_key(&consumer) {
+            return Err(DomainError::InvalidArgument {
+                message: format!("consumer {} is already registered", consumer.get()),
+            });
+        }
+
+        let queue = queues.declare_passive(queue.as_ref(), connection)?;
+        let queue = queue.name().clone();
+        queues.add_consumer(queue.as_str(), connection, consumer)?;
+
+        self.consumers.insert(
+            consumer,
+            ConsumerState {
+                connection,
+                channel,
+                queue,
+                inflight: 0,
+            },
+        );
+        self.channels
+            .entry(channel)
+            .or_default()
+            .consumers
+            .insert(consumer);
+        Ok(())
+    }
+
+    /// Applies a prefetch limit and returns the resulting credit signals.
+    ///
+    /// A count of zero means unlimited. Consumer-scoped limits produce one
+    /// signal per consumer on the channel; channel-scoped limits produce one
+    /// aggregate signal.
+    pub fn set_prefetch(
+        &mut self,
+        channel: ChannelId,
+        prefetch_count: u32,
+        global: bool,
+    ) -> Vec<CreditSignal> {
+        let consumers: Vec<ConsumerId> = self
+            .channels
+            .entry(channel)
+            .or_default()
+            .consumers
+            .iter()
+            .copied()
+            .collect();
+
+        if global {
+            let state = self.channels.get_mut(&channel).expect("channel exists");
+            state.channel_prefetch = prefetch_count;
+            vec![CreditSignal::Channel {
+                channel,
+                credit: available_slots(prefetch_count, state.inflight),
+            }]
+        } else {
+            self.channels
+                .get_mut(&channel)
+                .expect("channel exists")
+                .consumer_prefetch = prefetch_count;
+            consumers
+                .into_iter()
+                .map(|consumer| {
+                    let inflight = self
+                        .consumers
+                        .get(&consumer)
+                        .map_or(0, |state| state.inflight);
+                    CreditSignal::Consumer {
+                        consumer,
+                        credit: available_slots(prefetch_count, inflight),
+                    }
+                })
+                .collect()
+        }
+    }
+
+    /// Delivers ready messages to consumers with available credit.
+    ///
+    /// Returns the number of messages delivered in this call.
+    pub fn dispatch(
+        &mut self,
+        queues: &mut QueueRegistry,
+        queue: impl AsRef<str>,
+        sink: &mut dyn DeliverySink,
+    ) -> Result<usize, DomainError> {
+        let name = queue.as_ref();
+        let mut delivered = 0;
+
+        loop {
+            let queue = queues
+                .queue(name)
+                .ok_or_else(|| DomainError::QueueNotFound {
+                    vhost: String::new(),
+                    queue: name.to_string(),
+                })?;
+            if queue.is_empty() {
+                break;
+            }
+            let Some(consumer) = self.next_consumer(name, queue) else {
+                break;
+            };
+            let Some((message, redelivered)) = queues.take_message(name) else {
+                break;
+            };
+            let delivery_tag = self.record_delivery(consumer, message.clone());
+            sink.deliver(Delivery {
+                consumer,
+                delivery_tag,
+                message,
+                redelivered,
+            });
+            delivered += 1;
+        }
+
+        Ok(delivered)
+    }
+
+    /// Acknowledges one delivery or every delivery up to the tag.
+    pub fn ack(
+        &mut self,
+        channel: ChannelId,
+        delivery_tag: DeliveryTag,
+        multiple: bool,
+    ) -> Result<SettleOutcome, DomainError> {
+        let tags = self.selected_tags(channel, delivery_tag, multiple)?;
+        let removed = self.remove_unacked(channel, &tags);
+        let settled = removed.len();
+        let credit = self.credit_for_removed(channel, &removed);
+        Ok(SettleOutcome {
+            settled,
+            requeued: 0,
+            credit,
+        })
+    }
+
+    /// Rejects one delivery or every delivery up to the tag.
+    pub fn nack(
+        &mut self,
+        queues: &mut QueueRegistry,
+        channel: ChannelId,
+        delivery_tag: DeliveryTag,
+        multiple: bool,
+        requeue: bool,
+    ) -> Result<SettleOutcome, DomainError> {
+        self.settle(queues, channel, delivery_tag, multiple, requeue)
+    }
+
+    /// Rejects a single delivery.
+    pub fn reject(
+        &mut self,
+        queues: &mut QueueRegistry,
+        channel: ChannelId,
+        delivery_tag: DeliveryTag,
+        requeue: bool,
+    ) -> Result<SettleOutcome, DomainError> {
+        self.settle(queues, channel, delivery_tag, false, requeue)
+    }
+
+    /// Requeues every unacknowledged delivery on the channel.
+    pub fn recover(
+        &mut self,
+        queues: &mut QueueRegistry,
+        channel: ChannelId,
+    ) -> Result<SettleOutcome, DomainError> {
+        let tags: Vec<DeliveryTag> = self
+            .channels
+            .get(&channel)
+            .map(|state| state.unacked.keys().copied().collect())
+            .unwrap_or_default();
+        if tags.is_empty() {
+            return Ok(SettleOutcome::default());
+        }
+
+        let removed = self.remove_unacked(channel, &tags);
+        let settled = removed.len();
+        let credit = self.credit_for_removed(channel, &removed);
+        let requeued = requeue_entries(queues, removed);
+        Ok(SettleOutcome {
+            settled,
+            requeued,
+            credit,
+        })
+    }
+
+    /// Requeues unacknowledged deliveries for a connection, then cleans up.
+    pub fn close_connection(
+        &mut self,
+        queues: &mut QueueRegistry,
+        connection: ConnectionId,
+    ) -> ConnectionCloseOutcome {
+        let consumers: Vec<ConsumerId> = self
+            .consumers
+            .iter()
+            .filter(|(_, state)| state.connection == connection)
+            .map(|(consumer, _)| *consumer)
+            .collect();
+
+        let mut requeued = Vec::new();
+        for consumer in &consumers {
+            let Some(channel) = self.consumers.get(consumer).map(|state| state.channel) else {
+                continue;
+            };
+            let tags: Vec<DeliveryTag> = self
+                .channels
+                .get(&channel)
+                .map(|state| {
+                    state
+                        .unacked
+                        .iter()
+                        .filter(|(_, entry)| entry.consumer == *consumer)
+                        .map(|(tag, _)| *tag)
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !tags.is_empty() {
+                requeued.extend(self.remove_unacked(channel, &tags));
+            }
+        }
+
+        for consumer in &consumers {
+            if let Some(state) = self.consumers.remove(consumer) {
+                if let Some(channel) = self.channels.get_mut(&state.channel) {
+                    channel.consumers.remove(consumer);
+                }
+            }
+        }
+        self.cursors
+            .retain(|_, consumer| !consumers.contains(consumer));
+
+        requeue_entries(queues, requeued);
+        queues.close_connection(connection)
+    }
+
+    /// Returns the number of unacknowledged deliveries on a channel.
+    pub fn unacked_count(&self, channel: ChannelId) -> usize {
+        self.channels
+            .get(&channel)
+            .map_or(0, |state| state.unacked.len())
+    }
+
+    fn next_consumer(&self, queue_name: &str, queue: &Queue) -> Option<ConsumerId> {
+        let count = queue.consumer_count();
+        if count == 0 {
+            return None;
+        }
+
+        let start = self
+            .cursors
+            .get(queue_name)
+            .and_then(|last| queue.consumers().position(|candidate| candidate == *last))
+            .map_or(0, |position| (position + 1) % count);
+
+        for offset in 0..count {
+            let index = (start + offset) % count;
+            let Some(consumer) = queue.consumers().nth(index) else {
+                break;
+            };
+            if self.has_credit(consumer) {
+                return Some(consumer);
+            }
+        }
+
+        None
+    }
+
+    fn has_credit(&self, consumer: ConsumerId) -> bool {
+        let Some(state) = self.consumers.get(&consumer) else {
+            return false;
+        };
+        let Some(channel) = self.channels.get(&state.channel) else {
+            return false;
+        };
+        let consumer_ok =
+            channel.consumer_prefetch == 0 || state.inflight < channel.consumer_prefetch;
+        let channel_ok =
+            channel.channel_prefetch == 0 || channel.inflight < channel.channel_prefetch;
+        consumer_ok && channel_ok
+    }
+
+    fn record_delivery(&mut self, consumer: ConsumerId, message: Message) -> DeliveryTag {
+        let (channel, queue) = {
+            let state = self
+                .consumers
+                .get_mut(&consumer)
+                .expect("selected consumer is registered");
+            state.inflight += 1;
+            (state.channel, state.queue.clone())
+        };
+
+        let delivery_tag = {
+            let state = self
+                .channels
+                .get_mut(&channel)
+                .expect("consumer channel is registered");
+            state.inflight += 1;
+            let delivery_tag = state.allocate_tag();
+            state.unacked.insert(
+                delivery_tag,
+                Unacked {
+                    consumer,
+                    queue: queue.clone(),
+                    message,
+                },
+            );
+            delivery_tag
+        };
+
+        self.cursors.insert(queue, consumer);
+        delivery_tag
+    }
+
+    fn selected_tags(
+        &self,
+        channel: ChannelId,
+        delivery_tag: DeliveryTag,
+        multiple: bool,
+    ) -> Result<Vec<DeliveryTag>, DomainError> {
+        let state = self
+            .channels
+            .get(&channel)
+            .ok_or_else(|| unknown_delivery_tag(channel, delivery_tag))?;
+        if !state.unacked.contains_key(&delivery_tag) {
+            return Err(unknown_delivery_tag(channel, delivery_tag));
+        }
+
+        if multiple {
+            Ok(state
+                .unacked
+                .range(..=delivery_tag)
+                .map(|(tag, _)| *tag)
+                .collect())
+        } else {
+            Ok(vec![delivery_tag])
+        }
+    }
+
+    fn remove_unacked(&mut self, channel: ChannelId, tags: &[DeliveryTag]) -> Vec<Unacked> {
+        let mut removed = Vec::with_capacity(tags.len());
+        {
+            let Some(state) = self.channels.get_mut(&channel) else {
+                return removed;
+            };
+            for tag in tags {
+                if let Some(entry) = state.unacked.remove(tag) {
+                    removed.push(entry);
+                }
+            }
+            state.inflight = state.unacked.len() as u32;
+        }
+
+        for entry in &removed {
+            if let Some(state) = self.consumers.get_mut(&entry.consumer) {
+                state.inflight = state.inflight.saturating_sub(1);
+            }
+        }
+
+        removed
+    }
+
+    fn credit_for_removed(&self, channel: ChannelId, removed: &[Unacked]) -> Vec<CreditSignal> {
+        if removed.is_empty() {
+            return Vec::new();
+        }
+        let Some(state) = self.channels.get(&channel) else {
+            return Vec::new();
+        };
+
+        if state.channel_prefetch != 0 {
+            return vec![CreditSignal::Channel {
+                channel,
+                credit: removed.len() as u32,
+            }];
+        }
+
+        let mut counts: BTreeMap<ConsumerId, u32> = BTreeMap::new();
+        for entry in removed {
+            *counts.entry(entry.consumer).or_default() += 1;
+        }
+        counts
+            .into_iter()
+            .map(|(consumer, credit)| CreditSignal::Consumer { consumer, credit })
+            .collect()
+    }
+
+    fn settle(
+        &mut self,
+        queues: &mut QueueRegistry,
+        channel: ChannelId,
+        delivery_tag: DeliveryTag,
+        multiple: bool,
+        requeue: bool,
+    ) -> Result<SettleOutcome, DomainError> {
+        let tags = self.selected_tags(channel, delivery_tag, multiple)?;
+        let removed = self.remove_unacked(channel, &tags);
+        let settled = removed.len();
+        let credit = self.credit_for_removed(channel, &removed);
+        let requeued = if requeue {
+            requeue_entries(queues, removed)
+        } else {
+            0
+        };
+        Ok(SettleOutcome {
+            settled,
+            requeued,
+            credit,
+        })
+    }
+}
+
+fn available_slots(limit: u32, inflight: u32) -> u32 {
+    if limit == 0 {
+        0
+    } else {
+        limit.saturating_sub(inflight)
+    }
+}
+
+fn requeue_entries(queues: &mut QueueRegistry, entries: Vec<Unacked>) -> usize {
+    let mut grouped: BTreeMap<QueueName, Vec<Message>> = BTreeMap::new();
+    for entry in entries {
+        grouped.entry(entry.queue).or_default().push(entry.message);
+    }
+
+    let mut requeued = 0;
+    for (queue, messages) in grouped {
+        for message in messages.into_iter().rev() {
+            if queues.requeue_message(queue.as_str(), message, true) {
+                requeued += 1;
+            }
+        }
+    }
+    requeued
+}
+
+fn unknown_delivery_tag(channel: ChannelId, delivery_tag: DeliveryTag) -> DomainError {
+    DomainError::PreconditionFailed {
+        message: format!(
+            "unknown delivery tag {} on channel {}",
+            delivery_tag.get(),
+            channel.get()
+        ),
+    }
+}
