@@ -5,7 +5,7 @@ use wolf_broker::{
     Delivery, DeliverySink, Message, MessageMetadata, Vhost, VhostId, VhostName,
 };
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct RecordingSink {
     deliveries: Vec<Delivery>,
     cancels: Vec<ConsumerCancel>,
@@ -268,8 +268,8 @@ fn close_connection_requeues_basic_get_unacked_as_well() {
     assert!(got.redelivered);
 }
 
-#[test]
-fn deleting_a_queue_forgets_its_consumers_in_the_vhost_dispatcher() {
+#[tokio::test]
+async fn deleting_a_queue_forgets_its_consumers_in_the_vhost_dispatcher() {
     let mut queues = QueueRegistry::new();
     let vhost = Vhost::with_routing(
         VhostId::new(1),
@@ -293,10 +293,12 @@ fn deleting_a_queue_forgets_its_consumers_in_the_vhost_dispatcher() {
             "jobs",
             ConsumerOptions::default(),
         )
+        .await
         .expect("consume");
 
     let outcome = vhost
         .delete_queue("jobs", connection, false, false)
+        .await
         .expect("delete");
     assert_eq!(
         outcome.cancels,
@@ -308,7 +310,8 @@ fn deleting_a_queue_forgets_its_consumers_in_the_vhost_dispatcher() {
 
     vhost
         .declare_queue("jobs", QueueConfig::default(), connection)
+        .await
         .expect("redeclare");
-    let mut sink = RecordingSink::default();
-    assert_eq!(vhost.dispatch_all(&mut sink).expect("dispatch"), 0);
+    let sink = RecordingSink::default();
+    assert_eq!(vhost.dispatch_all(sink).await.expect("dispatch"), 0);
 }
