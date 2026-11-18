@@ -31,6 +31,9 @@ pub use exchange::{
     ExchangeRegistry,
 };
 pub use message::Message;
+pub use queue::{
+    ConnectionCloseOutcome, ConnectionId, Queue, QueueConfig, QueueDeleteOutcome, QueueRegistry,
+};
 pub use topic::{RoutingKey, TopicPattern, TopicTrie};
 pub use validation::{QueueArguments, UNSUPPORTED_QUEUE_ARGUMENTS, validate_queue_arguments};
 pub use vhost::{Vhost, VhostId, VhostName};

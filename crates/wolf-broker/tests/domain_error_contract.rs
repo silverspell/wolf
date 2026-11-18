@@ -20,6 +20,7 @@ fn error_shape(error: &DomainError) -> (&'static str, Vec<String>) {
         }
         DomainError::InvalidArgument { message } => ("InvalidArgument", vec![message.clone()]),
         DomainError::AccessRefused { message } => ("AccessRefused", vec![message.clone()]),
+        DomainError::ResourceLocked { message } => ("ResourceLocked", vec![message.clone()]),
         DomainError::PreconditionFailed { message } => {
             ("PreconditionFailed", vec![message.clone()])
         }
@@ -76,6 +77,9 @@ fn error_variants_are_field_exact() {
         },
         DomainError::AccessRefused {
             message: "denied".to_string(),
+        },
+        DomainError::ResourceLocked {
+            message: "locked".to_string(),
         },
         DomainError::PreconditionFailed {
             message: "mismatch".to_string(),

@@ -124,6 +124,7 @@ impl AmqpError {
             | DomainError::InvalidArgument { .. }
             | DomainError::PreconditionFailed { .. } => ReplyCode::PreconditionFailed,
             DomainError::AccessRefused { .. } => ReplyCode::AccessRefused,
+            DomainError::ResourceLocked { .. } => ReplyCode::ResourceLocked,
             DomainError::CommandInvalid { .. } | DomainError::BrokerClosed => {
                 ReplyCode::CommandInvalid
             }
@@ -243,6 +244,12 @@ mod tests {
                     message: "denied".into(),
                 },
                 ReplyCode::AccessRefused,
+            ),
+            (
+                DomainError::ResourceLocked {
+                    message: "locked".into(),
+                },
+                ReplyCode::ResourceLocked,
             ),
             (
                 DomainError::PreconditionFailed {
