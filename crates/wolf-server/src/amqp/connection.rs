@@ -183,22 +183,22 @@ impl Connection {
     }
 
     /// Handles one decoded client frame, returning frames to write back.
-    pub fn handle_frame(&mut self, frame: Frame) -> Result<Vec<Frame>, AmqpError> {
+    pub async fn handle_frame(&mut self, frame: Frame) -> Result<Vec<Frame>, AmqpError> {
         match frame {
             Frame::Heartbeat { .. } => Ok(Vec::new()),
-            Frame::Method { channel, method } => self.handle_method(channel, method),
+            Frame::Method { channel, method } => self.handle_method(channel, method).await,
             Frame::ContentHeader { channel, header } => {
-                let result = self.handle_content_header(channel, header);
-                self.finish_channel_result(channel, result)
+                let result = self.handle_content_header(channel, header).await;
+                self.finish_channel_result(channel, result).await
             }
             Frame::ContentBody { channel, body } => {
-                let result = self.handle_content_body(channel, body);
-                self.finish_channel_result(channel, result)
+                let result = self.handle_content_body(channel, body).await;
+                self.finish_channel_result(channel, result).await
             }
         }
     }
 
-    fn handle_method(
+    async fn handle_method(
         &mut self,
         frame_channel: u16,
         method: Method,
@@ -218,7 +218,7 @@ impl Connection {
                     "connection methods must use channel 0",
                 ));
             }
-            return self.handle_connection_method(method);
+            return self.handle_connection_method(method).await;
         }
 
         if frame_channel == 0 {
@@ -229,11 +229,11 @@ impl Connection {
             ));
         }
 
-        let result = self.handle_channel_method(frame_channel, method);
-        self.finish_channel_result(frame_channel, result)
+        let result = self.handle_channel_method(frame_channel, method).await;
+        self.finish_channel_result(frame_channel, result).await
     }
 
-    fn finish_channel_result(
+    async fn finish_channel_result(
         &mut self,
         frame_channel: u16,
         result: Result<Vec<Frame>, AmqpError>,
@@ -246,7 +246,7 @@ impl Connection {
                     .get(&frame_channel)
                     .map(|channel| channel.broker_id)
                 {
-                    self.cleanup_channel(frame_channel, broker_channel);
+                    self.cleanup_channel(frame_channel, broker_channel).await;
                 }
                 if let Some(channel) = self.channels.get_mut(&frame_channel) {
                     channel.begin_close();
@@ -257,7 +257,7 @@ impl Connection {
         }
     }
 
-    fn handle_connection_method(&mut self, method: Method) -> Result<Vec<Frame>, AmqpError> {
+    async fn handle_connection_method(&mut self, method: Method) -> Result<Vec<Frame>, AmqpError> {
         let Method::Connection(method) = method else {
             return Err(self.command_invalid(0, 0, "expected a connection method"));
         };
@@ -273,7 +273,7 @@ impl Connection {
                 self.handle_open(open.virtual_host, open.insist)
             }
             (State::Open, ConnectionMethod::Close(_)) => {
-                self.cleanup_connection();
+                self.cleanup_connection().await;
                 self.state = State::Closed;
                 Ok(vec![Frame::Method {
                     channel: 0,
@@ -281,7 +281,7 @@ impl Connection {
                 }])
             }
             (_, ConnectionMethod::Close(_)) => {
-                self.cleanup_connection();
+                self.cleanup_connection().await;
                 self.state = State::Closed;
                 Ok(vec![Frame::Method {
                     channel: 0,
@@ -358,7 +358,7 @@ impl Connection {
         }
     }
 
-    fn handle_channel_method(
+    async fn handle_channel_method(
         &mut self,
         frame_channel: u16,
         method: Method,
@@ -381,10 +381,10 @@ impl Connection {
         }
 
         match method {
-            Method::Channel(ChannelMethod::Open(_)) => self.open_channel(frame_channel),
-            Method::Channel(ChannelMethod::Close(_)) => self.close_channel(frame_channel),
+            Method::Channel(ChannelMethod::Open(_)) => self.open_channel(frame_channel).await,
+            Method::Channel(ChannelMethod::Close(_)) => self.close_channel(frame_channel).await,
             Method::Channel(ChannelMethod::Flow(flow)) => {
-                self.channel_flow(frame_channel, flow.active)
+                self.channel_flow(frame_channel, flow.active).await
             }
             Method::Channel(method) => Err(self.command_invalid(
                 channel::CLASS_ID,
@@ -392,7 +392,7 @@ impl Connection {
                 "client sent a server-only channel method",
             )),
             Method::Confirm(ConfirmMethod::Select(select)) => {
-                self.confirm_select(frame_channel, select)
+                self.confirm_select(frame_channel, select).await
             }
             Method::Confirm(ConfirmMethod::SelectOk(_)) => Err(self.command_invalid(
                 confirm::CLASS_ID,
@@ -400,36 +400,46 @@ impl Connection {
                 "client sent a server-only confirm method",
             )),
             Method::Basic(BasicMethod::Publish(publish)) => {
-                self.basic_publish(frame_channel, publish)
+                self.basic_publish(frame_channel, publish).await
             }
-            Method::Basic(BasicMethod::Qos(qos)) => self.basic_qos(frame_channel, qos),
+            Method::Basic(BasicMethod::Qos(qos)) => self.basic_qos(frame_channel, qos).await,
             Method::Basic(BasicMethod::Consume(consume)) => {
-                self.basic_consume(frame_channel, consume)
+                self.basic_consume(frame_channel, consume).await
             }
-            Method::Basic(BasicMethod::Cancel(cancel)) => self.basic_cancel(frame_channel, cancel),
-            Method::Basic(BasicMethod::Get(get)) => self.basic_get(frame_channel, get),
-            Method::Basic(BasicMethod::Ack(ack)) => self.basic_ack(frame_channel, ack),
-            Method::Basic(BasicMethod::Nack(nack)) => self.basic_nack(frame_channel, nack),
-            Method::Basic(BasicMethod::Reject(reject)) => self.basic_reject(frame_channel, reject),
+            Method::Basic(BasicMethod::Cancel(cancel)) => {
+                self.basic_cancel(frame_channel, cancel).await
+            }
+            Method::Basic(BasicMethod::Get(get)) => self.basic_get(frame_channel, get).await,
+            Method::Basic(BasicMethod::Ack(ack)) => self.basic_ack(frame_channel, ack).await,
+            Method::Basic(BasicMethod::Nack(nack)) => self.basic_nack(frame_channel, nack).await,
+            Method::Basic(BasicMethod::Reject(reject)) => {
+                self.basic_reject(frame_channel, reject).await
+            }
             Method::Basic(BasicMethod::Recover(recover)) => {
-                self.basic_recover(frame_channel, recover)
+                self.basic_recover(frame_channel, recover).await
             }
             Method::Basic(BasicMethod::RecoverAsync(recover)) => {
-                self.basic_recover_async(frame_channel, recover)
+                self.basic_recover_async(frame_channel, recover).await
             }
             Method::Exchange(ExchangeMethod::Declare(declare)) => {
-                self.exchange_declare(frame_channel, declare)
+                self.exchange_declare(frame_channel, declare).await
             }
             Method::Exchange(ExchangeMethod::Delete(delete)) => {
-                self.exchange_delete(frame_channel, delete)
+                self.exchange_delete(frame_channel, delete).await
             }
             Method::Queue(QueueMethod::Declare(declare)) => {
-                self.queue_declare(frame_channel, declare)
+                self.queue_declare(frame_channel, declare).await
             }
-            Method::Queue(QueueMethod::Bind(bind)) => self.queue_bind(frame_channel, bind),
-            Method::Queue(QueueMethod::Unbind(unbind)) => self.queue_unbind(frame_channel, unbind),
-            Method::Queue(QueueMethod::Purge(purge)) => self.queue_purge(frame_channel, purge),
-            Method::Queue(QueueMethod::Delete(delete)) => self.queue_delete(frame_channel, delete),
+            Method::Queue(QueueMethod::Bind(bind)) => self.queue_bind(frame_channel, bind).await,
+            Method::Queue(QueueMethod::Unbind(unbind)) => {
+                self.queue_unbind(frame_channel, unbind).await
+            }
+            Method::Queue(QueueMethod::Purge(purge)) => {
+                self.queue_purge(frame_channel, purge).await
+            }
+            Method::Queue(QueueMethod::Delete(delete)) => {
+                self.queue_delete(frame_channel, delete).await
+            }
             Method::Basic(method) => Err(self.command_invalid(
                 basic::CLASS_ID,
                 method.method_id(),
@@ -454,61 +464,61 @@ impl Connection {
         }
     }
 
-    fn exchange_declare(
+    async fn exchange_declare(
         &mut self,
         frame_channel: u16,
         request: wolf_amqp_codec::ExchangeDeclare,
     ) -> Result<Vec<Frame>, AmqpError> {
         let vhost = self.resolved_vhost(exchange::CLASS_ID, exchange::DECLARE)?;
-        exchange_handler::declare(vhost, frame_channel, request)
+        exchange_handler::declare(vhost, frame_channel, request).await
     }
 
-    fn exchange_delete(
+    async fn exchange_delete(
         &mut self,
         frame_channel: u16,
         request: wolf_amqp_codec::ExchangeDelete,
     ) -> Result<Vec<Frame>, AmqpError> {
         let vhost = self.resolved_vhost(exchange::CLASS_ID, exchange::DELETE)?;
-        exchange_handler::delete(vhost, frame_channel, request)
+        exchange_handler::delete(vhost, frame_channel, request).await
     }
 
-    fn queue_declare(
+    async fn queue_declare(
         &mut self,
         frame_channel: u16,
         request: wolf_amqp_codec::QueueDeclare,
     ) -> Result<Vec<Frame>, AmqpError> {
         let vhost = self.resolved_vhost(queue::CLASS_ID, queue::DECLARE)?;
-        queue_handler::declare(vhost, frame_channel, self.broker_connection, request)
+        queue_handler::declare(vhost, frame_channel, self.broker_connection, request).await
     }
 
-    fn queue_bind(
+    async fn queue_bind(
         &mut self,
         frame_channel: u16,
         request: wolf_amqp_codec::QueueBind,
     ) -> Result<Vec<Frame>, AmqpError> {
         let vhost = self.resolved_vhost(queue::CLASS_ID, queue::BIND)?;
-        queue_handler::bind(vhost, frame_channel, self.broker_connection, request)
+        queue_handler::bind(vhost, frame_channel, self.broker_connection, request).await
     }
 
-    fn queue_unbind(
+    async fn queue_unbind(
         &mut self,
         frame_channel: u16,
         request: wolf_amqp_codec::QueueUnbind,
     ) -> Result<Vec<Frame>, AmqpError> {
         let vhost = self.resolved_vhost(queue::CLASS_ID, queue::UNBIND)?;
-        queue_handler::unbind(vhost, frame_channel, self.broker_connection, request)
+        queue_handler::unbind(vhost, frame_channel, self.broker_connection, request).await
     }
 
-    fn queue_purge(
+    async fn queue_purge(
         &mut self,
         frame_channel: u16,
         request: wolf_amqp_codec::QueuePurge,
     ) -> Result<Vec<Frame>, AmqpError> {
         let vhost = self.resolved_vhost(queue::CLASS_ID, queue::PURGE)?;
-        queue_handler::purge(vhost, frame_channel, self.broker_connection, request)
+        queue_handler::purge(vhost, frame_channel, self.broker_connection, request).await
     }
 
-    fn queue_delete(
+    async fn queue_delete(
         &mut self,
         frame_channel: u16,
         request: wolf_amqp_codec::QueueDelete,
@@ -532,6 +542,7 @@ impl Connection {
             &mut self.consumers,
             &self.hub,
         )
+        .await
     }
 
     fn resolved_vhost(&self, class_id: u16, method_id: u16) -> Result<&Vhost, AmqpError> {
@@ -543,7 +554,7 @@ impl Connection {
             .map_err(|error| AmqpError::from_domain(&error).with_offending(class_id, method_id))
     }
 
-    fn confirm_select(
+    async fn confirm_select(
         &mut self,
         frame_channel: u16,
         select: wolf_amqp_codec::ConfirmSelect,
@@ -562,7 +573,7 @@ impl Connection {
             .collect())
     }
 
-    fn basic_publish(
+    async fn basic_publish(
         &mut self,
         frame_channel: u16,
         publish: BasicPublish,
@@ -586,7 +597,7 @@ impl Connection {
         Ok(Vec::new())
     }
 
-    fn handle_content_header(
+    async fn handle_content_header(
         &mut self,
         frame_channel: u16,
         header: ContentHeader,
@@ -613,12 +624,12 @@ impl Connection {
         };
 
         match completed {
-            Some(completed) => self.complete_publish(frame_channel, completed),
+            Some(completed) => self.complete_publish(frame_channel, completed).await,
             None => Ok(Vec::new()),
         }
     }
 
-    fn handle_content_body(
+    async fn handle_content_body(
         &mut self,
         frame_channel: u16,
         body: bytes::Bytes,
@@ -641,12 +652,12 @@ impl Connection {
         };
 
         match completed {
-            Some(completed) => self.complete_publish(frame_channel, completed),
+            Some(completed) => self.complete_publish(frame_channel, completed).await,
             None => Ok(Vec::new()),
         }
     }
 
-    fn complete_publish(
+    async fn complete_publish(
         &mut self,
         frame_channel: u16,
         completed: CompletedPublish,
@@ -673,6 +684,7 @@ impl Connection {
 
         let outcome = broker
             .publish(&vhost_name, self.broker_connection, request)
+            .await
             .map_err(|error| {
                 AmqpError::from_domain(&error).with_offending(basic::CLASS_ID, basic::PUBLISH)
             })?;
@@ -684,7 +696,7 @@ impl Connection {
             PublishOutcome::Routed { .. } | PublishOutcome::Dropped => Vec::new(),
         };
 
-        vhost.dispatch_all(&mut self.hub.sink()).map_err(|error| {
+        vhost.dispatch_all(self.hub.sink()).await.map_err(|error| {
             AmqpError::from_domain(&error).with_offending(basic::CLASS_ID, basic::PUBLISH)
         })?;
 
@@ -716,7 +728,7 @@ impl Connection {
             .ok_or_else(|| self.command_invalid(class_id, method_id, "channel is not open"))
     }
 
-    fn basic_qos(
+    async fn basic_qos(
         &mut self,
         frame_channel: u16,
         request: BasicQos,
@@ -728,10 +740,10 @@ impl Connection {
         let vhost = broker.vhost(&name).map_err(|error| {
             AmqpError::from_domain(&error).with_offending(basic::CLASS_ID, basic_consume::QOS)
         })?;
-        basic_consume_handler::qos(vhost, broker_channel, &self.hub, frame_channel, request)
+        basic_consume_handler::qos(vhost, broker_channel, &self.hub, frame_channel, request).await
     }
 
-    fn basic_consume(
+    async fn basic_consume(
         &mut self,
         frame_channel: u16,
         request: BasicConsume,
@@ -753,9 +765,10 @@ impl Connection {
             self.broker_connection,
             request,
         )
+        .await
     }
 
-    fn basic_cancel(
+    async fn basic_cancel(
         &mut self,
         frame_channel: u16,
         request: BasicCancel,
@@ -772,9 +785,10 @@ impl Connection {
             frame_channel,
             request,
         )
+        .await
     }
 
-    fn basic_get(
+    async fn basic_get(
         &mut self,
         frame_channel: u16,
         request: BasicGet,
@@ -794,9 +808,10 @@ impl Connection {
             self.frame_max,
             request,
         )
+        .await
     }
 
-    fn basic_ack(
+    async fn basic_ack(
         &mut self,
         frame_channel: u16,
         request: BasicAck,
@@ -808,10 +823,10 @@ impl Connection {
         let vhost = broker.vhost(&name).map_err(|error| {
             AmqpError::from_domain(&error).with_offending(basic::CLASS_ID, basic_ack::ACK)
         })?;
-        basic_ack_handler::ack(vhost, broker_channel, &self.hub, request)
+        basic_ack_handler::ack(vhost, broker_channel, &self.hub, request).await
     }
 
-    fn basic_nack(
+    async fn basic_nack(
         &mut self,
         frame_channel: u16,
         request: BasicNack,
@@ -823,10 +838,10 @@ impl Connection {
         let vhost = broker.vhost(&name).map_err(|error| {
             AmqpError::from_domain(&error).with_offending(basic::CLASS_ID, basic_ack::NACK)
         })?;
-        basic_ack_handler::nack(vhost, broker_channel, &self.hub, request)
+        basic_ack_handler::nack(vhost, broker_channel, &self.hub, request).await
     }
 
-    fn basic_reject(
+    async fn basic_reject(
         &mut self,
         frame_channel: u16,
         request: BasicReject,
@@ -838,10 +853,10 @@ impl Connection {
         let vhost = broker.vhost(&name).map_err(|error| {
             AmqpError::from_domain(&error).with_offending(basic::CLASS_ID, basic_ack::REJECT)
         })?;
-        basic_ack_handler::reject(vhost, broker_channel, &self.hub, request)
+        basic_ack_handler::reject(vhost, broker_channel, &self.hub, request).await
     }
 
-    fn basic_recover(
+    async fn basic_recover(
         &mut self,
         frame_channel: u16,
         request: BasicRecover,
@@ -853,10 +868,10 @@ impl Connection {
         let vhost = broker.vhost(&name).map_err(|error| {
             AmqpError::from_domain(&error).with_offending(basic::CLASS_ID, basic_recover::RECOVER)
         })?;
-        basic_ack_handler::recover(vhost, broker_channel, &self.hub, frame_channel, request)
+        basic_ack_handler::recover(vhost, broker_channel, &self.hub, frame_channel, request).await
     }
 
-    fn basic_recover_async(
+    async fn basic_recover_async(
         &mut self,
         frame_channel: u16,
         request: BasicRecoverAsync,
@@ -869,7 +884,7 @@ impl Connection {
             AmqpError::from_domain(&error)
                 .with_offending(basic::CLASS_ID, basic_recover::RECOVER_ASYNC)
         })?;
-        basic_ack_handler::recover_async(vhost, broker_channel, &self.hub, request)
+        basic_ack_handler::recover_async(vhost, broker_channel, &self.hub, request).await
     }
 
     /// Handles a delivery or cancellation routed to this connection.
@@ -904,7 +919,7 @@ impl Connection {
     }
 
     /// Cleans up broker consumer state and unacked deliveries for one channel.
-    fn cleanup_channel(&mut self, frame_channel: u16, broker_channel: ChannelId) {
+    async fn cleanup_channel(&mut self, frame_channel: u16, broker_channel: ChannelId) {
         let Some(name) = self.vhost.clone() else {
             for (consumer, _) in self.consumers.remove_channel(frame_channel) {
                 self.hub.unregister(consumer);
@@ -913,11 +928,11 @@ impl Connection {
         };
         let broker = Arc::clone(&self.broker);
         if let Ok(vhost) = broker.vhost(&name) {
-            let _ = vhost.close_channel(broker_channel);
+            let _ = vhost.close_channel(broker_channel).await;
             for (consumer, _) in self.consumers.remove_channel(frame_channel) {
                 self.hub.unregister(consumer);
             }
-            let _ = vhost.dispatch_all(&mut self.hub.sink());
+            let _ = vhost.dispatch_all(self.hub.sink()).await;
         } else {
             for (consumer, _) in self.consumers.remove_channel(frame_channel) {
                 self.hub.unregister(consumer);
@@ -926,7 +941,7 @@ impl Connection {
     }
 
     /// Cleans up all broker state owned by this connection. Idempotent.
-    pub fn cleanup_connection(&mut self) {
+    pub async fn cleanup_connection(&mut self) {
         if self.cleaned {
             return;
         }
@@ -935,8 +950,8 @@ impl Connection {
         if let Some(name) = self.vhost.clone() {
             let broker = Arc::clone(&self.broker);
             if let Ok(vhost) = broker.vhost(&name) {
-                let _ = vhost.close_connection(self.broker_connection);
-                let _ = vhost.dispatch_all(&mut self.hub.sink());
+                let _ = vhost.close_connection(self.broker_connection).await;
+                let _ = vhost.dispatch_all(self.hub.sink()).await;
             }
         }
         for (consumer, _) in self.consumers.drain() {
@@ -945,7 +960,7 @@ impl Connection {
         self.channels.clear();
     }
 
-    fn open_channel(&mut self, frame_channel: u16) -> Result<Vec<Frame>, AmqpError> {
+    async fn open_channel(&mut self, frame_channel: u16) -> Result<Vec<Frame>, AmqpError> {
         if self.channel_max != 0 && frame_channel > self.channel_max {
             return Err(self.command_invalid(
                 channel::CLASS_ID,
@@ -970,7 +985,7 @@ impl Connection {
         }])
     }
 
-    fn close_channel(&mut self, frame_channel: u16) -> Result<Vec<Frame>, AmqpError> {
+    async fn close_channel(&mut self, frame_channel: u16) -> Result<Vec<Frame>, AmqpError> {
         let Some(broker_channel) = self
             .channels
             .get(&frame_channel)
@@ -982,7 +997,7 @@ impl Connection {
                 "channel is not open",
             ));
         };
-        self.cleanup_channel(frame_channel, broker_channel);
+        self.cleanup_channel(frame_channel, broker_channel).await;
         self.channels.remove(&frame_channel);
         Ok(vec![Frame::Method {
             channel: frame_channel,
@@ -990,7 +1005,11 @@ impl Connection {
         }])
     }
 
-    fn channel_flow(&mut self, frame_channel: u16, active: bool) -> Result<Vec<Frame>, AmqpError> {
+    async fn channel_flow(
+        &mut self,
+        frame_channel: u16,
+        active: bool,
+    ) -> Result<Vec<Frame>, AmqpError> {
         let Some(channel) = self.channels.get_mut(&frame_channel) else {
             return Err(self.command_invalid(
                 channel::CLASS_ID,
@@ -1139,10 +1158,10 @@ mod tests {
         assert_eq!(negotiate_heartbeat(60, 120), 60);
     }
 
-    #[test]
-    fn tune_ok_negotiates_channel_frame_and_heartbeat_values() {
+    #[tokio::test]
+    async fn tune_ok_negotiates_channel_frame_and_heartbeat_values() {
         let mut connection = connection();
-        connection.handle_frame(start_ok()).expect("start-ok");
+        connection.handle_frame(start_ok()).await.expect("start-ok");
         assert_eq!(connection.state(), State::AwaitingTuneOk);
         connection
             .handle_frame(Frame::Method {
@@ -1153,16 +1172,17 @@ mod tests {
                     heartbeat: 0,
                 })),
             })
+            .await
             .expect("tune-ok");
         assert_eq!(connection.channel_max(), 100);
         assert_eq!(connection.frame_max(), 65_536);
         assert_eq!(connection.heartbeat(), 60);
     }
 
-    #[test]
-    fn channel_open_and_flow_follow_the_negotiated_state() {
+    #[tokio::test]
+    async fn channel_open_and_flow_follow_the_negotiated_state() {
         let mut connection = connection();
-        connection.handle_frame(start_ok()).expect("start-ok");
+        connection.handle_frame(start_ok()).await.expect("start-ok");
         connection
             .handle_frame(Frame::Method {
                 channel: 0,
@@ -1172,6 +1192,7 @@ mod tests {
                     heartbeat: 0,
                 })),
             })
+            .await
             .expect("tune-ok");
         connection
             .handle_frame(Frame::Method {
@@ -1182,6 +1203,7 @@ mod tests {
                     insist: false,
                 })),
             })
+            .await
             .expect("open");
 
         let opened = connection
@@ -1191,6 +1213,7 @@ mod tests {
                     out_of_band: ShortString::new(""),
                 })),
             })
+            .await
             .expect("channel open");
         assert!(matches!(
             opened.as_slice(),
@@ -1207,6 +1230,7 @@ mod tests {
                     active: false,
                 })),
             })
+            .await
             .expect_err("flow false is unsupported");
         assert_eq!(error.reply_code, ReplyCode::NotImplemented);
     }

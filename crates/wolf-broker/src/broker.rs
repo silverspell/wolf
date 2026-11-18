@@ -41,13 +41,13 @@ impl Broker {
     }
 
     /// Publishes a message through the named virtual host.
-    pub fn publish<P>(
+    pub async fn publish<P>(
         &self,
         vhost: &VhostName,
         connection: ConnectionId,
         request: PublishRequest<'_, P>,
     ) -> Result<PublishOutcome<P>, DomainError> {
-        self.vhost(vhost)?.publish(connection, request)
+        self.vhost(vhost)?.publish(connection, request).await
     }
 
     /// Verifies the virtual host and then reports that the queue is unknown.

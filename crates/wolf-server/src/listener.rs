@@ -252,7 +252,7 @@ async fn run_session(
         }
     }
 
-    session.shutdown();
+    session.shutdown().await;
     drain_before_close(&mut stream).await;
     let _ = stream.shutdown().await;
 }
@@ -289,7 +289,7 @@ async fn process_buffer(
         match decode_frame(&data) {
             Ok((frame, used)) => {
                 data.advance(used);
-                match session.dispatch(frame) {
+                match session.dispatch(frame).await {
                     Ok(frames) => {
                         if write_frames(stream, &frames).await.is_err() {
                             return Ok(ProcessOutcome::IoError);

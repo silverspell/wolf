@@ -10,13 +10,15 @@ use crate::amqp::arguments;
 use crate::amqp::error::AmqpError;
 
 /// Handles `exchange.declare`.
-pub fn declare(
+pub async fn declare(
     vhost: &Vhost,
     channel: u16,
     request: ExchangeDeclare,
 ) -> Result<Vec<Frame>, AmqpError> {
     let result = if request.passive {
-        vhost.declare_exchange_passive(request.exchange.as_str())
+        vhost
+            .declare_exchange_passive(request.exchange.as_str())
+            .await
     } else {
         let kind = ExchangeKind::parse(request.exchange_type.as_str())
             .map_err(|error| exchange_error(&error, exchange::DECLARE))?;
@@ -29,7 +31,9 @@ pub fn declare(
             internal: request.internal,
             arguments,
         };
-        vhost.declare_exchange(request.exchange.as_str(), config)
+        vhost
+            .declare_exchange(request.exchange.as_str(), config)
+            .await
     };
 
     result.map_err(|error| exchange_error(&error, exchange::DECLARE))?;
@@ -44,13 +48,14 @@ pub fn declare(
 }
 
 /// Handles `exchange.delete`.
-pub fn delete(
+pub async fn delete(
     vhost: &Vhost,
     channel: u16,
     request: ExchangeDelete,
 ) -> Result<Vec<Frame>, AmqpError> {
     vhost
         .delete_exchange(request.exchange.as_str(), request.if_unused)
+        .await
         .map_err(|error| exchange_error(&error, exchange::DELETE))?;
 
     if request.nowait {

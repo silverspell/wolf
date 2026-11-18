@@ -12,7 +12,7 @@ use crate::amqp::error::AmqpError;
 
 /// Handles `basic.get`, returning either a message with content or an empty
 /// reply.
-pub fn get(
+pub async fn get(
     vhost: &Vhost,
     channel: u16,
     broker_channel: ChannelId,
@@ -27,6 +27,7 @@ pub fn get(
             request.queue.as_str(),
             request.no_ack,
         )
+        .await
         .map_err(|error| get_error(&error))?;
 
     match outcome {

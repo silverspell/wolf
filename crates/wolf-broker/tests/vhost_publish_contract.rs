@@ -23,8 +23,8 @@ fn vhost(queues: QueueRegistry) -> Vhost {
     Vhost::with_routing(VhostId::new(1), valid_name(), Router::default(), queues)
 }
 
-#[test]
-fn default_exchange_publish_is_routed_to_the_named_queue() {
+#[tokio::test]
+async fn default_exchange_publish_is_routed_to_the_named_queue() {
     let connection = ConnectionId::new(1);
     let mut queues = QueueRegistry::new();
     queues
@@ -43,6 +43,7 @@ fn default_exchange_publish_is_routed_to_the_named_queue() {
                 properties: (),
             },
         )
+        .await
         .expect("publish is routed");
 
     assert_eq!(outcome, PublishOutcome::Routed { queues: 1 });
@@ -50,8 +51,8 @@ fn default_exchange_publish_is_routed_to_the_named_queue() {
     assert_eq!(vhost.queue_message_count("missing"), 0);
 }
 
-#[test]
-fn mandatory_return_preserves_the_body_handle_and_properties() {
+#[tokio::test]
+async fn mandatory_return_preserves_the_body_handle_and_properties() {
     let connection = ConnectionId::new(1);
     let vhost = vhost(QueueRegistry::new());
     let body = Bytes::from_static(b"return-me");
@@ -68,6 +69,7 @@ fn mandatory_return_preserves_the_body_handle_and_properties() {
                 properties: Properties { id: 9 },
             },
         )
+        .await
         .expect("mandatory publish completes");
 
     let PublishOutcome::Returned(Returned {
@@ -86,8 +88,8 @@ fn mandatory_return_preserves_the_body_handle_and_properties() {
     assert_eq!(properties, Properties { id: 9 });
 }
 
-#[test]
-fn publish_to_unknown_exchange_is_a_domain_error() {
+#[tokio::test]
+async fn publish_to_unknown_exchange_is_a_domain_error() {
     let connection = ConnectionId::new(1);
     let vhost = vhost(QueueRegistry::new());
 
@@ -102,6 +104,7 @@ fn publish_to_unknown_exchange_is_a_domain_error() {
                 properties: (),
             },
         )
+        .await
         .expect_err("unknown exchange must fail");
 
     assert!(matches!(
@@ -110,8 +113,8 @@ fn publish_to_unknown_exchange_is_a_domain_error() {
     ));
 }
 
-#[test]
-fn publishing_to_an_exclusive_queue_from_another_connection_is_rejected() {
+#[tokio::test]
+async fn publishing_to_an_exclusive_queue_from_another_connection_is_rejected() {
     let owner = ConnectionId::new(1);
     let intruder = ConnectionId::new(2);
     let mut queues = QueueRegistry::new();
@@ -138,14 +141,15 @@ fn publishing_to_an_exclusive_queue_from_another_connection_is_rejected() {
                 properties: (),
             },
         )
+        .await
         .expect_err("exclusive access must be denied");
 
     assert!(matches!(error, DomainError::ResourceLocked { .. }));
     assert_eq!(vhost.queue_message_count("private"), 0);
 }
 
-#[test]
-fn broker_publish_resolves_the_vhost_and_delegates() {
+#[tokio::test]
+async fn broker_publish_resolves_the_vhost_and_delegates() {
     let name = valid_name();
     let connection = ConnectionId::new(1);
     let mut queues = QueueRegistry::new();
@@ -175,6 +179,7 @@ fn broker_publish_resolves_the_vhost_and_delegates() {
                 properties: (),
             },
         )
+        .await
         .expect("broker publish succeeds");
 
     assert_eq!(outcome, PublishOutcome::Routed { queues: 1 });
@@ -187,8 +192,8 @@ fn broker_publish_resolves_the_vhost_and_delegates() {
     );
 }
 
-#[test]
-fn broker_publish_reports_a_missing_vhost() {
+#[tokio::test]
+async fn broker_publish_reports_a_missing_vhost() {
     let broker = Broker::new();
     let name = valid_name();
 
@@ -204,6 +209,7 @@ fn broker_publish_reports_a_missing_vhost() {
                 properties: (),
             },
         )
+        .await
         .expect_err("missing vhost must fail");
 
     assert_eq!(error, DomainError::VhostNotFound { vhost: "/".into() });

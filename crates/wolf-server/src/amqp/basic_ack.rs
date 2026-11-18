@@ -14,7 +14,7 @@ use crate::amqp::error::{AmqpError, ReplyCode};
 use crate::delivery::DeliveryHub;
 
 /// Handles `basic.ack`. There is no reply on success.
-pub fn ack(
+pub async fn ack(
     vhost: &Vhost,
     broker_channel: ChannelId,
     hub: &DeliveryHub,
@@ -26,15 +26,17 @@ pub fn ack(
             DeliveryTag::new(request.delivery_tag),
             request.multiple,
         )
+        .await
         .map_err(|error| basic_error(&error, basic_ack::ACK))?;
     vhost
-        .dispatch_all(&mut hub.sink())
+        .dispatch_all(hub.sink())
+        .await
         .map_err(|error| basic_error(&error, basic_ack::ACK))?;
     Ok(Vec::new())
 }
 
 /// Handles `basic.nack`. There is no reply on success.
-pub fn nack(
+pub async fn nack(
     vhost: &Vhost,
     broker_channel: ChannelId,
     hub: &DeliveryHub,
@@ -47,15 +49,17 @@ pub fn nack(
             request.multiple,
             request.requeue,
         )
+        .await
         .map_err(|error| basic_error(&error, basic_ack::NACK))?;
     vhost
-        .dispatch_all(&mut hub.sink())
+        .dispatch_all(hub.sink())
+        .await
         .map_err(|error| basic_error(&error, basic_ack::NACK))?;
     Ok(Vec::new())
 }
 
 /// Handles `basic.reject`. There is no reply on success.
-pub fn reject(
+pub async fn reject(
     vhost: &Vhost,
     broker_channel: ChannelId,
     hub: &DeliveryHub,
@@ -67,15 +71,17 @@ pub fn reject(
             DeliveryTag::new(request.delivery_tag),
             request.requeue,
         )
+        .await
         .map_err(|error| basic_error(&error, basic_ack::REJECT))?;
     vhost
-        .dispatch_all(&mut hub.sink())
+        .dispatch_all(hub.sink())
+        .await
         .map_err(|error| basic_error(&error, basic_ack::REJECT))?;
     Ok(Vec::new())
 }
 
 /// Handles `basic.recover`, replying with `basic.recover-ok`.
-pub fn recover(
+pub async fn recover(
     vhost: &Vhost,
     broker_channel: ChannelId,
     hub: &DeliveryHub,
@@ -88,7 +94,8 @@ pub fn recover(
         hub,
         request.requeue,
         basic_recover::RECOVER,
-    )?;
+    )
+    .await?;
     Ok(vec![Frame::Method {
         channel,
         method: Method::Basic(BasicMethod::RecoverOk(BasicRecoverOk)),
@@ -96,7 +103,7 @@ pub fn recover(
 }
 
 /// Handles `basic.recover-async`; no reply is sent.
-pub fn recover_async(
+pub async fn recover_async(
     vhost: &Vhost,
     broker_channel: ChannelId,
     hub: &DeliveryHub,
@@ -108,11 +115,12 @@ pub fn recover_async(
         hub,
         request.requeue,
         basic_recover::RECOVER_ASYNC,
-    )?;
+    )
+    .await?;
     Ok(Vec::new())
 }
 
-fn requeue_all(
+async fn requeue_all(
     vhost: &Vhost,
     broker_channel: ChannelId,
     hub: &DeliveryHub,
@@ -128,9 +136,11 @@ fn requeue_all(
     }
     vhost
         .recover(broker_channel)
+        .await
         .map_err(|error| basic_error(&error, method_id))?;
     vhost
-        .dispatch_all(&mut hub.sink())
+        .dispatch_all(hub.sink())
+        .await
         .map_err(|error| basic_error(&error, method_id))?;
     Ok(())
 }
