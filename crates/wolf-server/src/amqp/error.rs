@@ -120,10 +120,13 @@ impl AmqpError {
             DomainError::ExchangeNotFound { .. } | DomainError::QueueNotFound { .. } => {
                 ReplyCode::NotFound
             }
-            DomainError::AlreadyExists { .. } | DomainError::InvalidArgument { .. } => {
-                ReplyCode::PreconditionFailed
+            DomainError::AlreadyExists { .. }
+            | DomainError::InvalidArgument { .. }
+            | DomainError::PreconditionFailed { .. } => ReplyCode::PreconditionFailed,
+            DomainError::AccessRefused { .. } => ReplyCode::AccessRefused,
+            DomainError::CommandInvalid { .. } | DomainError::BrokerClosed => {
+                ReplyCode::CommandInvalid
             }
-            DomainError::BrokerClosed => ReplyCode::CommandInvalid,
         };
         Self::new(reply_code, error.to_string())
     }
@@ -234,6 +237,24 @@ mod tests {
                     message: "bad".into(),
                 },
                 ReplyCode::PreconditionFailed,
+            ),
+            (
+                DomainError::AccessRefused {
+                    message: "denied".into(),
+                },
+                ReplyCode::AccessRefused,
+            ),
+            (
+                DomainError::PreconditionFailed {
+                    message: "mismatch".into(),
+                },
+                ReplyCode::PreconditionFailed,
+            ),
+            (
+                DomainError::CommandInvalid {
+                    message: "unknown".into(),
+                },
+                ReplyCode::CommandInvalid,
             ),
             (DomainError::BrokerClosed, ReplyCode::CommandInvalid),
         ];

@@ -15,13 +15,20 @@ pub mod message;
 pub mod queue;
 pub mod router;
 pub mod stream;
+pub mod topic;
 pub mod vhost;
 
+pub use binding::{Binding, QueueName};
 pub use broker::Broker;
 pub use delivery::{
     CancelReason, ChannelId, ConsumerCancel, ConsumerId, CreditReceiver, CreditSignal, Delivery,
     DeliverySink, DeliveryTag,
 };
 pub use error::{DomainError, ResourceKind};
+pub use exchange::{
+    ArgumentValue, Exchange, ExchangeArguments, ExchangeConfig, ExchangeKind, ExchangeName,
+    ExchangeRegistry,
+};
 pub use message::Message;
+pub use topic::{RoutingKey, TopicPattern, TopicTrie};
 pub use vhost::{Vhost, VhostId, VhostName};

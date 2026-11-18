@@ -19,6 +19,11 @@ fn error_shape(error: &DomainError) -> (&'static str, Vec<String>) {
             ("AlreadyExists", vec![kind.to_string(), name.clone()])
         }
         DomainError::InvalidArgument { message } => ("InvalidArgument", vec![message.clone()]),
+        DomainError::AccessRefused { message } => ("AccessRefused", vec![message.clone()]),
+        DomainError::PreconditionFailed { message } => {
+            ("PreconditionFailed", vec![message.clone()])
+        }
+        DomainError::CommandInvalid { message } => ("CommandInvalid", vec![message.clone()]),
         DomainError::BrokerClosed => ("BrokerClosed", vec![]),
     }
 }
@@ -68,6 +73,15 @@ fn error_variants_are_field_exact() {
         },
         DomainError::InvalidArgument {
             message: "bad".to_string(),
+        },
+        DomainError::AccessRefused {
+            message: "denied".to_string(),
+        },
+        DomainError::PreconditionFailed {
+            message: "mismatch".to_string(),
+        },
+        DomainError::CommandInvalid {
+            message: "unknown".to_string(),
         },
         DomainError::BrokerClosed,
     ];
