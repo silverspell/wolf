@@ -1,5 +1,8 @@
 //! AMQP protocol adaptation shared by connection sessions.
 
+pub mod auth;
+pub mod channel;
+pub mod connection;
 pub mod error;
 
 /// Identifier of an AMQP method as a class id and method id pair.

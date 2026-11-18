@@ -1861,6 +1861,7 @@ dependencies = [
 name = "wolf-server"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "lapin",
  "tokio",
  "wolf-amqp-codec",
