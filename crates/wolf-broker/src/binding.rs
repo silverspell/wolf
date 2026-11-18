@@ -4,6 +4,7 @@
 //! routing key, fanout bindings form a set of queues, and topic bindings are
 //! stored in a [`TopicTrie`]. Insertion and removal are idempotent.
 
+use std::borrow::Borrow;
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::sync::Arc;
@@ -34,6 +35,12 @@ impl QueueName {
 
 impl AsRef<str> for QueueName {
     fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Borrow<str> for QueueName {
+    fn borrow(&self) -> &str {
         &self.0
     }
 }

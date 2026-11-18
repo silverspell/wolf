@@ -23,6 +23,7 @@ pub enum DomainError {
     AlreadyExists { kind: ResourceKind, name: String },
     InvalidArgument { message: String },
     AccessRefused { message: String },
+    ResourceLocked { message: String },
     PreconditionFailed { message: String },
     CommandInvalid { message: String },
     BrokerClosed,
@@ -43,6 +44,7 @@ impl fmt::Display for DomainError {
             }
             Self::InvalidArgument { message } => write!(f, "invalid argument: {message}"),
             Self::AccessRefused { message } => write!(f, "access refused: {message}"),
+            Self::ResourceLocked { message } => write!(f, "resource locked: {message}"),
             Self::PreconditionFailed { message } => {
                 write!(f, "precondition failed: {message}")
             }
