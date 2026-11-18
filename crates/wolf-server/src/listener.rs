@@ -239,7 +239,21 @@ async fn run_session(
     }
 
     session.shutdown();
+    drain_before_close(&mut stream).await;
     let _ = stream.shutdown().await;
+}
+
+async fn drain_before_close(stream: &mut TcpStream) {
+    let mut buffer = [0u8; 1024];
+    let _ = timeout(Duration::from_millis(250), async {
+        loop {
+            match stream.read(&mut buffer).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+    })
+    .await;
 }
 
 enum ProcessOutcome {
