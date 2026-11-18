@@ -14,6 +14,17 @@ wolf-amqp-codec = { path = "crates/wolf-amqp-codec" }
 wolf-stream-codec = { path = "crates/wolf-stream-codec" }
 wolf-storage = { path = "crates/wolf-storage" }
 wolf-broker = { path = "crates/wolf-broker" }
+bytes = "1"
+tokio = { version = "1", default-features = false, features = [
+    "sync",
+    "rt",
+    "rt-multi-thread",
+    "net",
+    "io-util",
+    "time",
+    "macros",
+    "signal",
+] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

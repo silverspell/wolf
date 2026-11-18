@@ -26,6 +26,23 @@ cargo test --workspace
 cargo run -p wolf-server
 ```
 
+## Authentication
+
+Wolf keeps the RabbitMQ-compatible `guest`/`guest` default account. Like
+RabbitMQ, the `guest` user may only connect from loopback addresses
+(`127.0.0.0/8`, `::1`). To use different credentials, set both environment
+variables together:
+
+```sh
+WOLF_DEFAULT_USER=app WOLF_DEFAULT_PASS=<password> cargo run -p wolf-server
+```
+
+Setting only one of the two variables makes the server refuse to start with a
+clear error. A user configured through the environment is not loopback
+restricted. Passwords are never logged. The guest default remains the only
+credential literal in source and is suppressed only on that line for the
+LoopFlow Semgrep rule (WOLF-22).
+
 ## License
 
 MIT, see [`LICENSE`](LICENSE).

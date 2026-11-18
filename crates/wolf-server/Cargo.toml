@@ -7,6 +7,10 @@ rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
 
+[lib]
+name = "wolf_server"
+path = "src/lib.rs"
+
 [[bin]]
 name = "wolf"
 path = "src/main.rs"
@@ -16,6 +20,12 @@ wolf-amqp-codec.workspace = true
 wolf-stream-codec.workspace = true
 wolf-storage.workspace = true
 wolf-broker.workspace = true
+bytes.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+futures-lite = "2"
+lapin = "3"
 
 [lints]
 workspace = true
