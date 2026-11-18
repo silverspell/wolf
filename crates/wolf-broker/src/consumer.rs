@@ -11,7 +11,15 @@ use crate::binding::QueueName;
 use crate::delivery::{ChannelId, ConsumerId, CreditSignal, Delivery, DeliverySink, DeliveryTag};
 use crate::error::DomainError;
 use crate::message::Message;
+use crate::publish::{GetOutcome, get_message};
 use crate::queue::{ConnectionCloseOutcome, ConnectionId, Queue, QueueRegistry};
+
+/// Options that affect how a consumer receives messages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ConsumerOptions {
+    /// Whether deliveries are not acknowledged by the client.
+    pub no_ack: bool,
+}
 
 #[derive(Debug, Clone)]
 struct ConsumerState {
@@ -19,10 +27,12 @@ struct ConsumerState {
     channel: ChannelId,
     queue: QueueName,
     inflight: u32,
+    no_ack: bool,
 }
 
 #[derive(Debug)]
 struct ChannelState {
+    connection: Option<ConnectionId>,
     consumers: BTreeSet<ConsumerId>,
     consumer_prefetch: u32,
     channel_prefetch: u32,
@@ -34,6 +44,7 @@ struct ChannelState {
 impl Default for ChannelState {
     fn default() -> Self {
         Self {
+            connection: None,
             consumers: BTreeSet::new(),
             consumer_prefetch: 0,
             channel_prefetch: 0,
@@ -57,7 +68,7 @@ impl ChannelState {
 
 #[derive(Debug, Clone)]
 struct Unacked {
-    consumer: ConsumerId,
+    consumer: Option<ConsumerId>,
     queue: QueueName,
     message: Message,
 }
@@ -86,7 +97,7 @@ impl ConsumerDispatcher {
         Self::default()
     }
 
-    /// Registers a consumer on a queue.
+    /// Registers a consumer on a queue using default (acknowledging) options.
     ///
     /// Queue membership remains owned by [`QueueRegistry`]; this only records
     /// the channel, connection and prefetch state needed for dispatch.
@@ -97,6 +108,26 @@ impl ConsumerDispatcher {
         channel: ChannelId,
         consumer: ConsumerId,
         queue: impl AsRef<str>,
+    ) -> Result<(), DomainError> {
+        self.register_with(
+            queues,
+            connection,
+            channel,
+            consumer,
+            queue,
+            ConsumerOptions::default(),
+        )
+    }
+
+    /// Registers a consumer with explicit acknowledgement options.
+    pub fn register_with(
+        &mut self,
+        queues: &mut QueueRegistry,
+        connection: ConnectionId,
+        channel: ChannelId,
+        consumer: ConsumerId,
+        queue: impl AsRef<str>,
+        options: ConsumerOptions,
     ) -> Result<(), DomainError> {
         if self.consumers.contains_key(&consumer) {
             return Err(DomainError::InvalidArgument {
@@ -115,13 +146,12 @@ impl ConsumerDispatcher {
                 channel,
                 queue,
                 inflight: 0,
+                no_ack: options.no_ack,
             },
         );
-        self.channels
-            .entry(channel)
-            .or_default()
-            .consumers
-            .insert(consumer);
+        let state = self.channels.entry(channel).or_default();
+        state.connection = Some(connection);
+        state.consumers.insert(consumer);
         Ok(())
     }
 
@@ -214,6 +244,48 @@ impl ConsumerDispatcher {
         Ok(delivered)
     }
 
+    /// Fetches one message for `basic.get`, tracking it for acknowledgement
+    /// unless `no_ack` is set.
+    pub fn get(
+        &mut self,
+        queues: &mut QueueRegistry,
+        connection: ConnectionId,
+        channel: ChannelId,
+        queue: impl AsRef<str>,
+        no_ack: bool,
+    ) -> Result<GetOutcome, DomainError> {
+        let name = queue.as_ref();
+        let outcome = get_message(queues, connection, name, no_ack)?;
+        let GetOutcome::Message(mut got) = outcome else {
+            return Ok(GetOutcome::Empty);
+        };
+
+        let queue_name = queues
+            .queue(name)
+            .map(|queue| queue.name().clone())
+            .ok_or_else(|| DomainError::QueueNotFound {
+                vhost: String::new(),
+                queue: name.to_string(),
+            })?;
+
+        let state = self.channels.entry(channel).or_default();
+        state.connection = Some(connection);
+        let delivery_tag = state.allocate_tag();
+        if !no_ack {
+            state.inflight += 1;
+            state.unacked.insert(
+                delivery_tag,
+                Unacked {
+                    consumer: None,
+                    queue: queue_name,
+                    message: got.message.clone(),
+                },
+            );
+        }
+        got.delivery_tag = Some(delivery_tag);
+        Ok(GetOutcome::Message(got))
+    }
+
     /// Acknowledges one delivery or every delivery up to the tag.
     pub fn ack(
         &mut self,
@@ -281,40 +353,84 @@ impl ConsumerDispatcher {
         })
     }
 
+    /// Cancels a consumer, removing its queue membership.
+    ///
+    /// Unacknowledged deliveries are left on the channel so they can still be
+    /// acknowledged or requeued when the channel or connection closes.
+    /// Returns whether the consumer was registered.
+    pub fn cancel(
+        &mut self,
+        queues: &mut QueueRegistry,
+        consumer: ConsumerId,
+    ) -> Result<bool, DomainError> {
+        let Some(state) = self.consumers.remove(&consumer) else {
+            return Ok(false);
+        };
+        if let Some(channel) = self.channels.get_mut(&state.channel) {
+            channel.consumers.remove(&consumer);
+        }
+        self.cursors.retain(|_, current| *current != consumer);
+        queues.remove_consumer(state.queue.as_str(), consumer)?;
+        Ok(true)
+    }
+
+    /// Removes consumer registrations after their queues have been deleted.
+    ///
+    /// Unacknowledged deliveries belonging to those consumers are discarded
+    /// because their queue no longer exists.
+    pub fn forget_consumers(&mut self, consumers: &[ConsumerId]) {
+        let mut per_channel: BTreeMap<ChannelId, Vec<DeliveryTag>> = BTreeMap::new();
+        for consumer in consumers {
+            let Some(state) = self.consumers.remove(consumer) else {
+                continue;
+            };
+            if let Some(channel) = self.channels.get_mut(&state.channel) {
+                channel.consumers.remove(consumer);
+                for (tag, entry) in &channel.unacked {
+                    if entry.consumer == Some(*consumer) {
+                        per_channel.entry(state.channel).or_default().push(*tag);
+                    }
+                }
+            }
+        }
+        self.cursors
+            .retain(|_, consumer| !consumers.contains(consumer));
+        for (channel, tags) in per_channel {
+            self.remove_unacked(channel, &tags);
+        }
+    }
+
     /// Requeues unacknowledged deliveries for a connection, then cleans up.
     pub fn close_connection(
         &mut self,
         queues: &mut QueueRegistry,
         connection: ConnectionId,
     ) -> ConnectionCloseOutcome {
+        let channels: Vec<ChannelId> = self
+            .channels
+            .iter()
+            .filter(|(_, state)| state.connection == Some(connection))
+            .map(|(channel, _)| *channel)
+            .collect();
+
+        let mut requeued = Vec::new();
+        for channel in &channels {
+            let tags: Vec<DeliveryTag> = self
+                .channels
+                .get(channel)
+                .map(|state| state.unacked.keys().copied().collect())
+                .unwrap_or_default();
+            if !tags.is_empty() {
+                requeued.extend(self.remove_unacked(*channel, &tags));
+            }
+        }
+
         let consumers: Vec<ConsumerId> = self
             .consumers
             .iter()
             .filter(|(_, state)| state.connection == connection)
             .map(|(consumer, _)| *consumer)
             .collect();
-
-        let mut requeued = Vec::new();
-        for consumer in &consumers {
-            let Some(channel) = self.consumers.get(consumer).map(|state| state.channel) else {
-                continue;
-            };
-            let tags: Vec<DeliveryTag> = self
-                .channels
-                .get(&channel)
-                .map(|state| {
-                    state
-                        .unacked
-                        .iter()
-                        .filter(|(_, entry)| entry.consumer == *consumer)
-                        .map(|(tag, _)| *tag)
-                        .collect()
-                })
-                .unwrap_or_default();
-            if !tags.is_empty() {
-                requeued.extend(self.remove_unacked(channel, &tags));
-            }
-        }
 
         for consumer in &consumers {
             if let Some(state) = self.consumers.remove(consumer) {
@@ -326,8 +442,51 @@ impl ConsumerDispatcher {
         self.cursors
             .retain(|_, consumer| !consumers.contains(consumer));
 
+        for channel in channels {
+            self.channels.remove(&channel);
+        }
+
         requeue_entries(queues, requeued);
         queues.close_connection(connection)
+    }
+
+    /// Requeues unacknowledged deliveries on a closing channel, then removes
+    /// its consumers and state.
+    pub fn close_channel(
+        &mut self,
+        queues: &mut QueueRegistry,
+        channel: ChannelId,
+    ) -> Result<SettleOutcome, DomainError> {
+        let Some(state) = self.channels.get(&channel) else {
+            return Ok(SettleOutcome::default());
+        };
+        let consumers: Vec<ConsumerId> = state.consumers.iter().copied().collect();
+        let tags: Vec<DeliveryTag> = state.unacked.keys().copied().collect();
+        let consumers: Vec<(ConsumerId, QueueName)> = consumers
+            .into_iter()
+            .filter_map(|consumer| {
+                self.consumers
+                    .get(&consumer)
+                    .map(|state| (consumer, state.queue.clone()))
+            })
+            .collect();
+
+        let removed = self.remove_unacked(channel, &tags);
+        let settled = removed.len();
+
+        for (consumer, queue) in &consumers {
+            self.consumers.remove(consumer);
+            self.cursors.retain(|_, current| current != consumer);
+            queues.remove_consumer(queue.as_str(), *consumer)?;
+        }
+        self.channels.remove(&channel);
+
+        let requeued = requeue_entries(queues, removed);
+        Ok(SettleOutcome {
+            settled,
+            requeued,
+            credit: Vec::new(),
+        })
     }
 
     /// Returns the number of unacknowledged deliveries on a channel.
@@ -366,6 +525,9 @@ impl ConsumerDispatcher {
         let Some(state) = self.consumers.get(&consumer) else {
             return false;
         };
+        if state.no_ack {
+            return true;
+        }
         let Some(channel) = self.channels.get(&state.channel) else {
             return false;
         };
@@ -377,13 +539,16 @@ impl ConsumerDispatcher {
     }
 
     fn record_delivery(&mut self, consumer: ConsumerId, message: Message) -> DeliveryTag {
-        let (channel, queue) = {
+        let (channel, queue, no_ack) = {
             let state = self
                 .consumers
                 .get_mut(&consumer)
                 .expect("selected consumer is registered");
-            state.inflight += 1;
-            (state.channel, state.queue.clone())
+            let no_ack = state.no_ack;
+            if !no_ack {
+                state.inflight += 1;
+            }
+            (state.channel, state.queue.clone(), no_ack)
         };
 
         let delivery_tag = {
@@ -391,16 +556,18 @@ impl ConsumerDispatcher {
                 .channels
                 .get_mut(&channel)
                 .expect("consumer channel is registered");
-            state.inflight += 1;
             let delivery_tag = state.allocate_tag();
-            state.unacked.insert(
-                delivery_tag,
-                Unacked {
-                    consumer,
-                    queue: queue.clone(),
-                    message,
-                },
-            );
+            if !no_ack {
+                state.inflight += 1;
+                state.unacked.insert(
+                    delivery_tag,
+                    Unacked {
+                        consumer: Some(consumer),
+                        queue: queue.clone(),
+                        message,
+                    },
+                );
+            }
             delivery_tag
         };
 
@@ -448,8 +615,10 @@ impl ConsumerDispatcher {
         }
 
         for entry in &removed {
-            if let Some(state) = self.consumers.get_mut(&entry.consumer) {
-                state.inflight = state.inflight.saturating_sub(1);
+            if let Some(consumer) = entry.consumer {
+                if let Some(state) = self.consumers.get_mut(&consumer) {
+                    state.inflight = state.inflight.saturating_sub(1);
+                }
             }
         }
 
@@ -473,7 +642,9 @@ impl ConsumerDispatcher {
 
         let mut counts: BTreeMap<ConsumerId, u32> = BTreeMap::new();
         for entry in removed {
-            *counts.entry(entry.consumer).or_default() += 1;
+            if let Some(consumer) = entry.consumer {
+                *counts.entry(consumer).or_default() += 1;
+            }
         }
         counts
             .into_iter()

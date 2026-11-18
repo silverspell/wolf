@@ -25,9 +25,9 @@ pub use frame::{
 pub use methods::basic::{
     BasicAck, BasicCancel, BasicCancelOk, BasicConsume, BasicConsumeOk, BasicDeliver, BasicGet,
     BasicGetEmpty, BasicGetOk, BasicMethod, BasicNack, BasicPublish, BasicQos, BasicQosOk,
-    BasicReject, BasicReturn,
+    BasicRecover, BasicRecoverAsync, BasicRecoverOk, BasicReject, BasicReturn,
 };
-pub use methods::basic::{basic_ack, basic_consume, basic_publish};
+pub use methods::basic::{basic_ack, basic_consume, basic_publish, basic_recover};
 pub use methods::channel::{
     ChannelClose, ChannelCloseOk, ChannelFlow, ChannelFlowOk, ChannelMethod, ChannelOpen,
     ChannelOpenOk,

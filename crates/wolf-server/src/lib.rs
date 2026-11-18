@@ -7,6 +7,7 @@ use wolf_stream_codec as _;
 
 pub mod amqp;
 pub mod config;
+pub mod delivery;
 pub mod listener;
 pub mod session;
 

@@ -6,12 +6,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use tokio::sync::mpsc::UnboundedSender;
 use wolf_amqp_codec::Frame;
 use wolf_broker::{Broker, ConnectionId as BrokerConnectionId};
 
 use crate::amqp::MethodKey;
 use crate::amqp::connection::Connection;
 use crate::amqp::error::AmqpError;
+use crate::delivery::{DeliveryHub, ServerEvent};
 
 /// Identifier assigned to an accepted connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -80,6 +82,26 @@ impl Session {
         }
     }
 
+    /// Creates a session that routes deliveries through a shared hub.
+    pub fn with_delivery(
+        id: ConnectionId,
+        peer: SocketAddr,
+        broker: Arc<Broker>,
+        hub: Arc<DeliveryHub>,
+        outbox: UnboundedSender<ServerEvent>,
+    ) -> Self {
+        Self {
+            id,
+            connection: Connection::with_delivery(
+                peer,
+                broker,
+                BrokerConnectionId::new(id.get()),
+                hub,
+                outbox,
+            ),
+        }
+    }
+
     /// Returns the identifier of this session's connection.
     pub const fn id(&self) -> ConnectionId {
         self.id
@@ -103,6 +125,16 @@ impl Session {
     /// Returns whether the connection has closed.
     pub const fn is_closed(&self) -> bool {
         self.connection.is_closed()
+    }
+
+    /// Converts a cross-connection delivery event into frames for this session.
+    pub fn delivery_event(&mut self, event: ServerEvent) -> Result<Vec<Frame>, AmqpError> {
+        self.connection.delivery_event(event)
+    }
+
+    /// Releases consumers and requeues unacknowledged deliveries on exit.
+    pub fn shutdown(&mut self) {
+        self.connection.cleanup_connection();
     }
 
     /// Returns the underlying connection state.

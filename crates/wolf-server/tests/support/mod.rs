@@ -10,10 +10,11 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 use wolf_amqp_codec::{
-    BasicMethod, BasicProperties, BasicPublish, ChannelClose, ChannelCloseOk, ChannelMethod,
-    ChannelOpen, ChannelOpenOk, Close, ConfirmMethod, ConfirmSelect, ConnectionMethod,
-    ContentHeader, FieldTable, Frame, LongString, Method, Open, ProtocolHeader, ShortString, Start,
-    StartOk, Tune, TuneOk,
+    BasicAck, BasicCancel, BasicConsume, BasicGet, BasicMethod, BasicNack, BasicProperties,
+    BasicPublish, BasicQos, BasicRecover, BasicRecoverAsync, BasicReject, ChannelClose,
+    ChannelCloseOk, ChannelMethod, ChannelOpen, ChannelOpenOk, Close, CloseOk, ConfirmMethod,
+    ConfirmSelect, ConnectionMethod, ContentHeader, FieldTable, Frame, LongString, Method, Open,
+    ProtocolHeader, ShortString, Start, StartOk, Tune, TuneOk,
 };
 use wolf_server::{ServerConfig, ShutdownHandle, start};
 
@@ -291,6 +292,178 @@ impl TestClient {
         if !body.is_empty() {
             self.send_content_body(channel, Bytes::copy_from_slice(body))
                 .await;
+        }
+    }
+
+    /// Sends `basic.qos`.
+    pub async fn send_qos(
+        &mut self,
+        channel: u16,
+        prefetch_size: u32,
+        prefetch_count: u16,
+        global: bool,
+    ) {
+        self.send_method(
+            channel,
+            Method::Basic(BasicMethod::Qos(BasicQos {
+                prefetch_size,
+                prefetch_count,
+                global,
+            })),
+        )
+        .await;
+    }
+
+    /// Sends `basic.consume`.
+    pub async fn send_consume(
+        &mut self,
+        channel: u16,
+        queue: &str,
+        consumer_tag: &str,
+        no_ack: bool,
+        nowait: bool,
+    ) {
+        self.send_method(
+            channel,
+            Method::Basic(BasicMethod::Consume(BasicConsume {
+                ticket: 0,
+                queue: ShortString::new(queue),
+                consumer_tag: ShortString::new(consumer_tag),
+                no_local: false,
+                no_ack,
+                exclusive: false,
+                nowait,
+                arguments: FieldTable::new(),
+            })),
+        )
+        .await;
+    }
+
+    /// Sends `basic.cancel`.
+    pub async fn send_cancel(&mut self, channel: u16, consumer_tag: &str, nowait: bool) {
+        self.send_method(
+            channel,
+            Method::Basic(BasicMethod::Cancel(BasicCancel {
+                consumer_tag: ShortString::new(consumer_tag),
+                nowait,
+            })),
+        )
+        .await;
+    }
+
+    /// Sends `basic.get`.
+    pub async fn send_get(&mut self, channel: u16, queue: &str, no_ack: bool) {
+        self.send_method(
+            channel,
+            Method::Basic(BasicMethod::Get(BasicGet {
+                ticket: 0,
+                queue: ShortString::new(queue),
+                no_ack,
+            })),
+        )
+        .await;
+    }
+
+    /// Sends `basic.ack`.
+    pub async fn send_ack(&mut self, channel: u16, delivery_tag: u64, multiple: bool) {
+        self.send_method(
+            channel,
+            Method::Basic(BasicMethod::Ack(BasicAck {
+                delivery_tag,
+                multiple,
+            })),
+        )
+        .await;
+    }
+
+    /// Sends `basic.nack`.
+    pub async fn send_nack(
+        &mut self,
+        channel: u16,
+        delivery_tag: u64,
+        multiple: bool,
+        requeue: bool,
+    ) {
+        self.send_method(
+            channel,
+            Method::Basic(BasicMethod::Nack(BasicNack {
+                delivery_tag,
+                multiple,
+                requeue,
+            })),
+        )
+        .await;
+    }
+
+    /// Sends `basic.reject`.
+    pub async fn send_reject(&mut self, channel: u16, delivery_tag: u64, requeue: bool) {
+        self.send_method(
+            channel,
+            Method::Basic(BasicMethod::Reject(BasicReject {
+                delivery_tag,
+                requeue,
+            })),
+        )
+        .await;
+    }
+
+    /// Sends `basic.recover`.
+    pub async fn send_recover(&mut self, channel: u16, requeue: bool) {
+        self.send_method(
+            channel,
+            Method::Basic(BasicMethod::Recover(BasicRecover { requeue })),
+        )
+        .await;
+    }
+
+    /// Sends `basic.recover-async`.
+    pub async fn send_recover_async(&mut self, channel: u16, requeue: bool) {
+        self.send_method(
+            channel,
+            Method::Basic(BasicMethod::RecoverAsync(BasicRecoverAsync { requeue })),
+        )
+        .await;
+    }
+
+    /// Reads a content header and its body for the expected channel.
+    pub async fn read_content(&mut self, expected_channel: u16) -> (ContentHeader, Bytes) {
+        let header = loop {
+            if let Frame::ContentHeader { channel, header } = self.read_frame().await {
+                if channel == expected_channel {
+                    break header;
+                }
+            }
+        };
+        let mut body = BytesMut::new();
+        while body.len() < header.body_size as usize {
+            if let Frame::ContentBody {
+                channel,
+                body: chunk,
+            } = self.read_frame().await
+            {
+                if channel == expected_channel {
+                    body.extend_from_slice(&chunk);
+                }
+            }
+        }
+        (header, body.freeze())
+    }
+
+    /// Sends `connection.close` and waits for `connection.close-ok`.
+    pub async fn close(&mut self) {
+        self.send_method(
+            0,
+            Method::Connection(ConnectionMethod::Close(Close {
+                reply_code: 200,
+                reply_text: ShortString::new("OK"),
+                class_id: 0,
+                method_id: 0,
+            })),
+        )
+        .await;
+        match self.read_connection_method().await {
+            ConnectionMethod::CloseOk(CloseOk) => {}
+            other => panic!("expected connection.close-ok, got {other:?}"),
         }
     }
 

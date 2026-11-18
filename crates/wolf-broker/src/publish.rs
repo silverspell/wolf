@@ -10,6 +10,7 @@
 //! encodes wire methods or allocates consumer delivery tags.
 
 use crate::binding::QueueName;
+use crate::delivery::DeliveryTag;
 use crate::error::DomainError;
 use crate::exchange::ExchangeName;
 use crate::message::Message;
@@ -76,6 +77,8 @@ pub struct GetMessage {
     pub ack_state: AckState,
     /// How many messages remain in the queue after this fetch.
     pub remaining: usize,
+    /// Delivery tag assigned when the fetch is tracked for acknowledgement.
+    pub delivery_tag: Option<DeliveryTag>,
 }
 
 /// The result of a `basic.get` request.
@@ -158,5 +161,6 @@ pub fn get_message(
         redelivered,
         ack_state,
         remaining,
+        delivery_tag: None,
     }))
 }

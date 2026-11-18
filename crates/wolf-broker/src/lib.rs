@@ -23,7 +23,7 @@ pub mod vhost;
 
 pub use binding::{Binding, QueueName};
 pub use broker::Broker;
-pub use consumer::{ConsumerDispatcher, SettleOutcome};
+pub use consumer::{ConsumerDispatcher, ConsumerOptions, SettleOutcome};
 pub use delivery::{
     CancelReason, ChannelId, ConsumerCancel, ConsumerId, CreditReceiver, CreditSignal, Delivery,
     DeliverySink, DeliveryTag,
@@ -33,7 +33,7 @@ pub use exchange::{
     ArgumentValue, Exchange, ExchangeArguments, ExchangeConfig, ExchangeKind, ExchangeName,
     ExchangeRegistry,
 };
-pub use message::Message;
+pub use message::{Message, MessageMetadata};
 pub use publish::{
     AckState, GetMessage, GetOutcome, PublishOutcome, PublishRequest, Returned, get_message,
     publish,
