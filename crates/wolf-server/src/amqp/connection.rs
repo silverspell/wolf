@@ -21,7 +21,7 @@ use crate::amqp::channel::Channel;
 use crate::amqp::confirm::ConfirmState;
 use crate::amqp::consumer::ConsumerDirectory;
 use crate::amqp::error::{AmqpError, CloseLevel, ReplyCode};
-use crate::amqp::{exchange as exchange_handler, queue as queue_handler};
+use crate::amqp::{exchange as exchange_handler, queue as queue_handler, unsupported};
 
 /// Default maximum number of channels advertised in `connection.tune`.
 pub const DEFAULT_CHANNEL_MAX: u16 = 2047;
@@ -380,6 +380,7 @@ impl Connection {
                 method.method_id(),
                 "client sent a server-only queue method",
             )),
+            Method::Tx(method) => unsupported::handle_tx(frame_channel, method),
             method => Err(self.command_invalid(
                 method.class_id(),
                 method.method_id(),

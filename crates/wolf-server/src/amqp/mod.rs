@@ -10,6 +10,7 @@ pub mod consumer;
 pub mod error;
 pub mod exchange;
 pub mod queue;
+pub mod unsupported;
 
 /// Identifier of an AMQP method as a class id and method id pair.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
