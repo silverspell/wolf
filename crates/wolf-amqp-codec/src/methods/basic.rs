@@ -8,6 +8,8 @@ use crate::types::{Reader, Writer};
 pub mod basic_ack;
 #[path = "basic_consume.rs"]
 pub mod basic_consume;
+#[path = "basic_publish.rs"]
+pub mod basic_publish;
 
 pub use basic_ack::{ACK, BasicAck, BasicNack, BasicReject, NACK, REJECT};
 pub use basic_consume::{
@@ -15,6 +17,7 @@ pub use basic_consume::{
     BasicGetEmpty, BasicGetOk, BasicQos, BasicQosOk, CANCEL, CANCEL_OK, CONSUME, CONSUME_OK,
     DELIVER, GET, GET_EMPTY, GET_OK, QOS, QOS_OK,
 };
+pub use basic_publish::{BasicPublish, BasicReturn, PUBLISH, RETURN};
 
 /// AMQP Basic class id.
 pub const CLASS_ID: u16 = 60;
@@ -34,6 +37,10 @@ pub enum BasicMethod {
     Cancel(BasicCancel),
     /// `basic.cancel-ok`
     CancelOk(BasicCancelOk),
+    /// `basic.publish`
+    Publish(BasicPublish),
+    /// `basic.return`
+    Return(BasicReturn),
     /// `basic.deliver`
     Deliver(BasicDeliver),
     /// `basic.get`
@@ -65,6 +72,8 @@ impl BasicMethod {
             Self::ConsumeOk(_) => CONSUME_OK,
             Self::Cancel(_) => CANCEL,
             Self::CancelOk(_) => CANCEL_OK,
+            Self::Publish(_) => PUBLISH,
+            Self::Return(_) => RETURN,
             Self::Deliver(_) => DELIVER,
             Self::Get(_) => GET,
             Self::GetOk(_) => GET_OK,
@@ -105,6 +114,18 @@ impl BasicMethod {
             }
             Self::CancelOk(method) => {
                 writer.write_short_string(method.consumer_tag.as_str())?;
+            }
+            Self::Publish(method) => {
+                writer.write_u16(method.ticket);
+                writer.write_short_string(method.exchange.as_str())?;
+                writer.write_short_string(method.routing_key.as_str())?;
+                writer.write_u8(pack_bits(&[method.mandatory, method.immediate]));
+            }
+            Self::Return(method) => {
+                writer.write_u16(method.reply_code);
+                writer.write_short_string(method.reply_text.as_str())?;
+                writer.write_short_string(method.exchange.as_str())?;
+                writer.write_short_string(method.routing_key.as_str())?;
             }
             Self::Deliver(method) => {
                 writer.write_short_string(method.consumer_tag.as_str())?;
@@ -177,6 +198,25 @@ impl BasicMethod {
             }),
             CANCEL_OK => Self::CancelOk(BasicCancelOk {
                 consumer_tag: reader.read_short_string()?,
+            }),
+            PUBLISH => {
+                let ticket = reader.read_u16()?;
+                let exchange = reader.read_short_string()?;
+                let routing_key = reader.read_short_string()?;
+                let bits = reader.read_u8()?;
+                Self::Publish(BasicPublish {
+                    ticket,
+                    exchange,
+                    routing_key,
+                    mandatory: bit_set(bits, 0),
+                    immediate: bit_set(bits, 1),
+                })
+            }
+            RETURN => Self::Return(BasicReturn {
+                reply_code: reader.read_u16()?,
+                reply_text: reader.read_short_string()?,
+                exchange: reader.read_short_string()?,
+                routing_key: reader.read_short_string()?,
             }),
             DELIVER => Self::Deliver(BasicDeliver {
                 consumer_tag: reader.read_short_string()?,

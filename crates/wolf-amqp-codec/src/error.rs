@@ -39,6 +39,10 @@ pub enum Error {
     TableNestingTooDeep { depth: usize },
     /// A frame payload exceeded the decoder's maximum frame size.
     FrameTooLarge { size: usize, max: usize },
+    /// The negotiated maximum frame size is too small to carry a content body.
+    FrameMaxTooSmall { frame_max: u32 },
+    /// The received content body length did not match the content header size.
+    BodySizeMismatch { expected: u64, actual: u64 },
 }
 
 impl fmt::Display for Error {
@@ -83,6 +87,15 @@ impl fmt::Display for Error {
             }
             Self::FrameTooLarge { size, max } => {
                 write!(f, "frame size {size} exceeds maximum {max}")
+            }
+            Self::FrameMaxTooSmall { frame_max } => {
+                write!(f, "frame_max {frame_max} is too small for a content body")
+            }
+            Self::BodySizeMismatch { expected, actual } => {
+                write!(
+                    f,
+                    "content body size mismatch: expected {expected}, actual {actual}"
+                )
             }
         }
     }
