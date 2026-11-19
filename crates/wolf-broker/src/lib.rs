@@ -28,7 +28,7 @@ pub use broker::Broker;
 pub use consumer::{ConsumerDispatcher, ConsumerOptions, SettleOutcome};
 pub use delivery::{
     CancelReason, ChannelId, ConsumerCancel, ConsumerId, CreditReceiver, CreditSignal,
-    DeliverOutcome, Delivery, DeliverySink, DeliveryTag,
+    DeliverOutcome, Delivery, DeliveryEvent, DeliverySink, DeliveryTag, OutboxSender,
 };
 pub use error::{DomainError, ResourceKind};
 pub use exchange::{
