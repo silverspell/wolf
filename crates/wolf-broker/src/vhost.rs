@@ -230,7 +230,7 @@ pub struct Vhost {
     id: VhostId,
     name: VhostName,
     router: RwLock<Router>,
-    queues: Mutex<BTreeMap<QueueName, Arc<QueueSlot>>>,
+    queues: RwLock<BTreeMap<QueueName, Arc<QueueSlot>>>,
     dispatcher: Dispatcher,
     next_server_name: AtomicU64,
     queue_channel_capacity: usize,
@@ -301,7 +301,7 @@ impl Vhost {
             id,
             name,
             router: RwLock::new(router),
-            queues: Mutex::new(slots),
+            queues: RwLock::new(slots),
             dispatcher,
             next_server_name: AtomicU64::new(0),
             queue_channel_capacity,
@@ -327,7 +327,7 @@ impl Vhost {
 
     fn slot(&self, name: &str) -> Result<Arc<QueueSlot>, DomainError> {
         self.queues
-            .lock()
+            .read()
             .map_err(|_| DomainError::BrokerClosed)?
             .get(name)
             .cloned()
@@ -338,7 +338,7 @@ impl Vhost {
     }
 
     fn maybe_slot(&self, name: &str) -> Option<Arc<QueueSlot>> {
-        self.queues.lock().ok()?.get(name).cloned()
+        self.queues.read().ok()?.get(name).cloned()
     }
 
     fn lock_queue<'a>(
@@ -361,7 +361,7 @@ impl Vhost {
         }
 
         let slots: Vec<Arc<QueueSlot>> = {
-            let queues = self.queues.lock().map_err(|_| DomainError::BrokerClosed)?;
+            let queues = self.queues.read().map_err(|_| DomainError::BrokerClosed)?;
             destinations
                 .iter()
                 .filter_map(|name| queues.get(name.as_str()).cloned())
@@ -571,14 +571,13 @@ impl Vhost {
     where
         S: DeliverySink + Send + Clone + 'static,
     {
-        let names: Vec<QueueName> = {
-            let queues = self.queues.lock().map_err(|_| DomainError::BrokerClosed)?;
-            queues.keys().cloned().collect()
+        let slots: Vec<Arc<QueueSlot>> = {
+            let queues = self.queues.read().map_err(|_| DomainError::BrokerClosed)?;
+            queues.values().cloned().collect()
         };
 
-        let mut pending = Vec::with_capacity(names.len());
-        for name in names {
-            let slot = self.slot(name.as_str())?;
+        let mut pending = Vec::with_capacity(slots.len());
+        for slot in slots {
             slot.ensure_task();
             let future = dispatch_future(
                 Arc::clone(&slot.queue),
@@ -630,13 +629,12 @@ impl Vhost {
     where
         S: DeliverySink + Send + Clone + 'static,
     {
-        let names: Vec<QueueName> = {
-            let queues = self.queues.lock().map_err(|_| DomainError::BrokerClosed)?;
-            queues.keys().cloned().collect()
+        let slots: Vec<Arc<QueueSlot>> = {
+            let queues = self.queues.read().map_err(|_| DomainError::BrokerClosed)?;
+            queues.values().cloned().collect()
         };
 
-        for name in names {
-            let slot = self.slot(name.as_str())?;
+        for slot in slots {
             slot.ensure_task();
             let future = dispatch_future(
                 Arc::clone(&slot.queue),
@@ -690,7 +688,7 @@ impl Vhost {
 
         let names: Vec<QueueName> = self
             .queues
-            .lock()
+            .read()
             .map(|queues| queues.keys().cloned().collect())
             .unwrap_or_default();
         let mut outcome = ConnectionCloseOutcome::default();
@@ -721,11 +719,25 @@ impl Vhost {
             }
 
             if remove {
-                if let Ok(mut queues) = self.queues.lock() {
-                    queues.remove(name.as_str());
+                let removed = self
+                    .queues
+                    .write()
+                    .map(|mut queues| {
+                        if queues
+                            .get(name.as_str())
+                            .is_some_and(|current| Arc::ptr_eq(current, &slot))
+                        {
+                            queues.remove(name.as_str());
+                            true
+                        } else {
+                            false
+                        }
+                    })
+                    .unwrap_or(false);
+                if removed {
+                    outcome.deleted_queues.push(name);
+                    outcome.cancels.extend(cancels);
                 }
-                outcome.deleted_queues.push(name);
-                outcome.cancels.extend(cancels);
             }
         }
 
@@ -866,55 +878,56 @@ impl Vhost {
 
         let (slot, queue_name) = if name.is_empty() {
             validate_queue_arguments(&config.arguments)?;
-            let mut queues = self.queues.lock().map_err(|_| DomainError::BrokerClosed)?;
-            let queue_name = self.generate_server_name(&queues);
-            let queue = Queue::new(queue_name.clone(), config, connection);
-            let slot = Arc::new(QueueSlot::new(
-                queue,
-                Arc::clone(&self.dispatcher),
-                self.queue_channel_capacity,
-            ));
-            queues.insert(queue_name.clone(), Arc::clone(&slot));
-            drop(queues);
+            let (slot, queue_name) = {
+                let mut queues = self.queues.write().map_err(|_| DomainError::BrokerClosed)?;
+                let queue_name = self.generate_server_name(&queues);
+                let queue = Queue::new(queue_name.clone(), config, connection);
+                let slot = Arc::new(QueueSlot::new(
+                    queue,
+                    Arc::clone(&self.dispatcher),
+                    self.queue_channel_capacity,
+                ));
+                queues.insert(queue_name.clone(), Arc::clone(&slot));
+                (slot, queue_name)
+            };
             slot.ensure_task();
             (slot, queue_name)
         } else {
             let queue_name = QueueName::new(name)?;
-            let existing = self
-                .queues
-                .lock()
-                .map_err(|_| DomainError::BrokerClosed)?
-                .get(name)
-                .cloned();
+            let existing = {
+                let queues = self.queues.read().map_err(|_| DomainError::BrokerClosed)?;
+                queues.get(name).cloned()
+            };
             match existing {
                 Some(slot) => {
-                    let queue = self.lock_queue(&slot)?;
-                    queue.check_access(connection)?;
-                    validate_queue_arguments(&config.arguments)?;
-                    if queue.config() != &config {
-                        return Err(DomainError::PreconditionFailed {
-                            message: format!(
-                                "queue '{}' already exists with different properties",
-                                queue_name.as_str()
-                            ),
-                        });
-                    }
-                    drop(queue);
+                    self.validate_redeclared_queue(&slot, &queue_name, &config, connection)?;
                     (slot, queue_name)
                 }
                 None => {
-                    validate_queue_arguments(&config.arguments)?;
-                    let queue = Queue::new(queue_name.clone(), config, connection);
-                    let slot = Arc::new(QueueSlot::new(
-                        queue,
-                        Arc::clone(&self.dispatcher),
-                        self.queue_channel_capacity,
-                    ));
-                    self.queues
-                        .lock()
-                        .map_err(|_| DomainError::BrokerClosed)?
-                        .insert(queue_name.clone(), Arc::clone(&slot));
-                    slot.ensure_task();
+                    let (slot, inserted) = {
+                        let mut queues =
+                            self.queues.write().map_err(|_| DomainError::BrokerClosed)?;
+                        match queues.get(name).cloned() {
+                            Some(winner) => (winner, false),
+                            None => {
+                                validate_queue_arguments(&config.arguments)?;
+                                let queue =
+                                    Queue::new(queue_name.clone(), config.clone(), connection);
+                                let slot = Arc::new(QueueSlot::new(
+                                    queue,
+                                    Arc::clone(&self.dispatcher),
+                                    self.queue_channel_capacity,
+                                ));
+                                queues.insert(queue_name.clone(), Arc::clone(&slot));
+                                (slot, true)
+                            }
+                        }
+                    };
+                    if inserted {
+                        slot.ensure_task();
+                    } else {
+                        self.validate_redeclared_queue(&slot, &queue_name, &config, connection)?;
+                    }
                     (slot, queue_name)
                 }
             }
@@ -996,10 +1009,15 @@ impl Vhost {
             (messages, cancels)
         };
 
-        self.queues
-            .lock()
-            .map_err(|_| DomainError::BrokerClosed)?
-            .remove(name);
+        {
+            let mut queues = self.queues.write().map_err(|_| DomainError::BrokerClosed)?;
+            if queues
+                .get(name)
+                .is_some_and(|current| Arc::ptr_eq(current, &slot))
+            {
+                queues.remove(name);
+            }
+        }
 
         if let Ok(mut dispatcher) = self.dispatcher.lock() {
             let consumers: Vec<ConsumerId> = cancels.iter().map(|cancel| cancel.consumer).collect();
@@ -1023,12 +1041,16 @@ impl Vhost {
             queue.is_auto_delete() && removed && queue.consumer_count() == 0
         };
         if auto_delete {
-            self.queues
-                .lock()
-                .map_err(|_| DomainError::BrokerClosed)?
-                .remove(queue_name);
+            let mut queues = self.queues.write().map_err(|_| DomainError::BrokerClosed)?;
+            let removed = queues
+                .get(queue_name)
+                .is_some_and(|current| Arc::ptr_eq(current, &slot));
+            if removed {
+                queues.remove(queue_name);
+            }
+            return Ok(removed);
         }
-        Ok(auto_delete)
+        Ok(false)
     }
 
     fn requeue_entries(&self, entries: Vec<(QueueName, Message)>) -> usize {
@@ -1051,6 +1073,27 @@ impl Vhost {
             }
         }
         requeued
+    }
+
+    fn validate_redeclared_queue(
+        &self,
+        slot: &Arc<QueueSlot>,
+        queue_name: &QueueName,
+        config: &QueueConfig,
+        connection: ConnectionId,
+    ) -> Result<(), DomainError> {
+        let queue = self.lock_queue(slot)?;
+        queue.check_access(connection)?;
+        validate_queue_arguments(&config.arguments)?;
+        if queue.config() != config {
+            return Err(DomainError::PreconditionFailed {
+                message: format!(
+                    "queue '{}' already exists with different properties",
+                    queue_name.as_str()
+                ),
+            });
+        }
+        Ok(())
     }
 
     fn generate_server_name(&self, queues: &BTreeMap<QueueName, Arc<QueueSlot>>) -> QueueName {
@@ -1154,6 +1197,61 @@ mod tests {
             .await
             .expect_err("default exchange bind");
         assert!(matches!(error, DomainError::AccessRefused { .. }));
+    }
+
+    #[test]
+    fn publish_does_not_take_the_exclusive_queue_directory_lock() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let vhost = Arc::new(vhost());
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+
+        let reader = {
+            let vhost = Arc::clone(&vhost);
+            std::thread::spawn(move || {
+                let guard = vhost.queues.read().expect("queue directory read lock");
+                entered_tx.send(()).expect("signal reader entered");
+                let _ = release_rx.recv();
+                drop(guard);
+            })
+        };
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("reader acquired the shared queue directory lock");
+
+        let (result_tx, result_rx) = mpsc::channel();
+        let publisher = {
+            let vhost = Arc::clone(&vhost);
+            std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .expect("current-thread runtime");
+                let outcome = runtime.block_on(vhost.publish(
+                    ConnectionId::new(1),
+                    PublishRequest {
+                        exchange: "",
+                        routing_key: "unknown-queue",
+                        mandatory: false,
+                        message: crate::message::Message::new(bytes::Bytes::from_static(b"x")),
+                        properties: (),
+                    },
+                ));
+                let _ = result_tx.send(outcome);
+            })
+        };
+
+        let outcome = result_rx.recv_timeout(Duration::from_secs(5));
+
+        let _ = release_tx.send(());
+        reader.join().expect("reader thread joins");
+        publisher.join().expect("publisher thread joins");
+
+        assert_eq!(
+            outcome.expect("publish completes while the shared lock is held"),
+            Ok(PublishOutcome::Dropped)
+        );
     }
 
     #[tokio::test]
