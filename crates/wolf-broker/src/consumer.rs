@@ -6,6 +6,8 @@
 //! unacknowledged messages with the redelivered flag set.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crate::binding::QueueName;
 use crate::delivery::{
@@ -15,14 +17,6 @@ use crate::error::DomainError;
 use crate::message::Message;
 use crate::publish::{GetOutcome, get_message};
 use crate::queue::{ConnectionCloseOutcome, ConnectionId, Queue, QueueRegistry};
-
-/// The result of closing a channel: settlement, entries to requeue, and the
-/// consumers whose queue membership must be removed by the caller.
-pub(crate) type ChannelClose = (
-    SettleOutcome,
-    Vec<(QueueName, Message)>,
-    Vec<(ConsumerId, QueueName)>,
-);
 
 /// Options that affect how a consumer receives messages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -513,253 +507,6 @@ impl ConsumerDispatcher {
             .map_or(0, |state| state.unacked.len())
     }
 
-    /// Returns whether a consumer is registered in the dispatcher.
-    pub(crate) fn contains_consumer(&self, consumer: ConsumerId) -> bool {
-        self.consumers.contains_key(&consumer)
-    }
-
-    /// Records a consumer whose queue membership is owned by the caller.
-    pub(crate) fn register_detached(
-        &mut self,
-        connection: ConnectionId,
-        channel: ChannelId,
-        consumer: ConsumerId,
-        queue: QueueName,
-        options: ConsumerOptions,
-    ) -> Result<(), DomainError> {
-        if self.consumers.contains_key(&consumer) {
-            return Err(DomainError::InvalidArgument {
-                message: format!("consumer {} is already registered", consumer.get()),
-            });
-        }
-
-        self.consumers.insert(
-            consumer,
-            ConsumerState {
-                connection,
-                channel,
-                queue,
-                inflight: 0,
-                no_ack: options.no_ack,
-            },
-        );
-        let state = self.channels.entry(channel).or_default();
-        state.connection = Some(connection);
-        state.consumers.insert(consumer);
-        Ok(())
-    }
-
-    /// Removes a consumer from the dispatcher without touching its queue.
-    pub(crate) fn detach_consumer(&mut self, consumer: ConsumerId) -> Option<QueueName> {
-        let state = self.consumers.remove(&consumer)?;
-        if let Some(channel) = self.channels.get_mut(&state.channel) {
-            channel.consumers.remove(&consumer);
-        }
-        self.cursors.retain(|_, current| *current != consumer);
-        Some(state.queue)
-    }
-
-    /// Takes at most one ready message from a queue and records the delivery.
-    pub(crate) fn take_next_delivery(&mut self, queue: &mut Queue) -> Option<Delivery> {
-        if queue.is_empty() {
-            return None;
-        }
-        let consumer = self.next_consumer(queue.name().as_str(), queue)?;
-        let (message, redelivered) = queue.take_front()?;
-        let delivery_tag = self.record_delivery(consumer, message.clone());
-        Some(Delivery {
-            consumer,
-            delivery_tag,
-            message,
-            redelivered,
-        })
-    }
-
-    /// Fetches one message from a queue the caller owns.
-    pub(crate) fn get_detached(
-        &mut self,
-        connection: ConnectionId,
-        channel: ChannelId,
-        queue: &mut Queue,
-        no_ack: bool,
-    ) -> Result<GetOutcome, DomainError> {
-        queue.check_access(connection)?;
-        let Some((message, redelivered)) = queue.take_front() else {
-            return Ok(GetOutcome::Empty);
-        };
-
-        let remaining = queue.message_count();
-        let ack_state = if no_ack {
-            crate::publish::AckState::NotRequired
-        } else {
-            crate::publish::AckState::Required
-        };
-
-        let state = self.channels.entry(channel).or_default();
-        state.connection = Some(connection);
-        let delivery_tag = state.allocate_tag();
-        if !no_ack {
-            state.inflight += 1;
-            state.unacked.insert(
-                delivery_tag,
-                Unacked {
-                    consumer: None,
-                    queue: queue.name().clone(),
-                    message: message.clone(),
-                },
-            );
-        }
-
-        Ok(GetOutcome::Message(crate::publish::GetMessage {
-            message,
-            redelivered,
-            ack_state,
-            remaining,
-            delivery_tag: Some(delivery_tag),
-        }))
-    }
-
-    /// Settles deliveries without requeueing them, returning the entries that
-    /// the caller must requeue.
-    pub(crate) fn settle_detached(
-        &mut self,
-        channel: ChannelId,
-        delivery_tag: DeliveryTag,
-        multiple: bool,
-        requeue: bool,
-    ) -> Result<(SettleOutcome, Vec<(QueueName, Message)>), DomainError> {
-        let tags = self.selected_tags(channel, delivery_tag, multiple)?;
-        let removed = self.remove_unacked(channel, &tags);
-        let settled = removed.len();
-        let credit = self.credit_for_removed(channel, &removed);
-        let entries = if requeue {
-            entries_to_pairs(removed)
-        } else {
-            Vec::new()
-        };
-        Ok((
-            SettleOutcome {
-                settled,
-                requeued: 0,
-                credit,
-            },
-            entries,
-        ))
-    }
-
-    /// Requeues every unacknowledged delivery on a channel, returning the
-    /// entries for the caller to place back into their queues.
-    pub(crate) fn recover_detached(
-        &mut self,
-        channel: ChannelId,
-    ) -> (SettleOutcome, Vec<(QueueName, Message)>) {
-        let tags: Vec<DeliveryTag> = self
-            .channels
-            .get(&channel)
-            .map(|state| state.unacked.keys().copied().collect())
-            .unwrap_or_default();
-        if tags.is_empty() {
-            return (SettleOutcome::default(), Vec::new());
-        }
-
-        let removed = self.remove_unacked(channel, &tags);
-        let settled = removed.len();
-        let credit = self.credit_for_removed(channel, &removed);
-        let entries = entries_to_pairs(removed);
-        (
-            SettleOutcome {
-                settled,
-                requeued: 0,
-                credit,
-            },
-            entries,
-        )
-    }
-
-    /// Closes a channel, returning requeued entries and removed consumers.
-    pub(crate) fn close_channel_detached(&mut self, channel: ChannelId) -> ChannelClose {
-        let Some(state) = self.channels.get(&channel) else {
-            return (SettleOutcome::default(), Vec::new(), Vec::new());
-        };
-        let consumers: Vec<ConsumerId> = state.consumers.iter().copied().collect();
-        let tags: Vec<DeliveryTag> = state.unacked.keys().copied().collect();
-        let consumers: Vec<(ConsumerId, QueueName)> = consumers
-            .into_iter()
-            .filter_map(|consumer| {
-                self.consumers
-                    .get(&consumer)
-                    .map(|state| (consumer, state.queue.clone()))
-            })
-            .collect();
-
-        let removed = self.remove_unacked(channel, &tags);
-        let settled = removed.len();
-
-        for (consumer, _) in &consumers {
-            self.consumers.remove(consumer);
-            self.cursors.retain(|_, current| current != consumer);
-        }
-        self.channels.remove(&channel);
-
-        (
-            SettleOutcome {
-                settled,
-                requeued: 0,
-                credit: Vec::new(),
-            },
-            entries_to_pairs(removed),
-            consumers,
-        )
-    }
-
-    /// Closes a connection, returning requeued entries and removed consumers.
-    pub(crate) fn close_connection_detached(
-        &mut self,
-        connection: ConnectionId,
-    ) -> (Vec<(QueueName, Message)>, Vec<ConsumerId>) {
-        let channels: Vec<ChannelId> = self
-            .channels
-            .iter()
-            .filter(|(_, state)| state.connection == Some(connection))
-            .map(|(channel, _)| *channel)
-            .collect();
-
-        let mut requeued = Vec::new();
-        for channel in &channels {
-            let tags: Vec<DeliveryTag> = self
-                .channels
-                .get(channel)
-                .map(|state| state.unacked.keys().copied().collect())
-                .unwrap_or_default();
-            if !tags.is_empty() {
-                requeued.extend(self.remove_unacked(*channel, &tags));
-            }
-        }
-
-        let consumers: Vec<ConsumerId> = self
-            .consumers
-            .iter()
-            .filter(|(_, state)| state.connection == connection)
-            .map(|(consumer, _)| *consumer)
-            .collect();
-
-        for consumer in &consumers {
-            if let Some(state) = self.consumers.remove(consumer) {
-                if let Some(channel) = self.channels.get_mut(&state.channel) {
-                    channel.consumers.remove(consumer);
-                }
-            }
-        }
-        self.cursors
-            .retain(|_, consumer| !consumers.contains(consumer));
-
-        for channel in channels {
-            self.channels.remove(&channel);
-        }
-
-        (entries_to_pairs(requeued), consumers)
-    }
-
     fn next_consumer(&self, queue_name: &str, queue: &Queue) -> Option<ConsumerId> {
         let count = queue.consumer_count();
         if count == 0 {
@@ -941,11 +688,205 @@ impl ConsumerDispatcher {
     }
 }
 
-fn entries_to_pairs(entries: Vec<Unacked>) -> Vec<(QueueName, Message)> {
-    entries
-        .into_iter()
-        .map(|entry| (entry.queue, entry.message))
-        .collect()
+/// Shared per-channel runtime used by queue-owned consumer state.
+///
+/// Delivery tags and prefetch accounting are channel-wide, while the consumers
+/// and unacknowledged deliveries that use them are split across queue tasks.
+#[derive(Debug)]
+pub(crate) struct ChannelRuntime {
+    connection: Mutex<Option<ConnectionId>>,
+    pub(crate) consumer_prefetch: AtomicU32,
+    pub(crate) channel_prefetch: AtomicU32,
+    pub(crate) inflight: AtomicU32,
+    next_tag: AtomicU64,
+}
+
+impl ChannelRuntime {
+    pub(crate) fn new(connection: Option<ConnectionId>) -> Self {
+        Self {
+            connection: Mutex::new(connection),
+            consumer_prefetch: AtomicU32::new(0),
+            channel_prefetch: AtomicU32::new(0),
+            inflight: AtomicU32::new(0),
+            next_tag: AtomicU64::new(1),
+        }
+    }
+
+    pub(crate) fn connection(&self) -> Option<ConnectionId> {
+        self.connection
+            .lock()
+            .map(|connection| *connection)
+            .unwrap_or(None)
+    }
+
+    pub(crate) fn set_connection(&self, connection: ConnectionId) {
+        if let Ok(mut current) = self.connection.lock() {
+            *current = Some(connection);
+        }
+    }
+
+    pub(crate) fn allocate_tag(&self) -> DeliveryTag {
+        let mut current = self.next_tag.load(Ordering::Relaxed);
+        loop {
+            let next = if current == u64::MAX { 1 } else { current + 1 };
+            match self.next_tag.compare_exchange_weak(
+                current,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return DeliveryTag::new(current),
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    pub(crate) fn reserve_channel_slot(&self) -> bool {
+        let limit = self.channel_prefetch.load(Ordering::Acquire);
+        loop {
+            let current = self.inflight.load(Ordering::Acquire);
+            if limit != 0 && current >= limit {
+                return false;
+            }
+            match self.inflight.compare_exchange_weak(
+                current,
+                current.saturating_add(1),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(_) => continue,
+            }
+        }
+    }
+
+    pub(crate) fn release_channel_slot(&self) {
+        loop {
+            let current = self.inflight.load(Ordering::Acquire);
+            let next = current.saturating_sub(1);
+            match self.inflight.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(_) => continue,
+            }
+        }
+    }
+
+    pub(crate) fn consumer_credit(&self, inflight: u32) -> u32 {
+        let limit = self.consumer_prefetch.load(Ordering::Acquire);
+        available_slots(limit, inflight)
+    }
+
+    pub(crate) fn channel_credit(&self) -> u32 {
+        let limit = self.channel_prefetch.load(Ordering::Acquire);
+        available_slots(limit, self.inflight.load(Ordering::Acquire))
+    }
+}
+
+/// A consumer registered on one queue, in queue registration order.
+#[derive(Debug, Clone)]
+pub(crate) struct QueueConsumer {
+    pub(crate) consumer: ConsumerId,
+    pub(crate) connection: ConnectionId,
+    pub(crate) channel: ChannelId,
+    pub(crate) no_ack: bool,
+    pub(crate) inflight: u32,
+    pub(crate) runtime: Arc<ChannelRuntime>,
+}
+
+/// An unacknowledged delivery owned by one queue.
+#[derive(Debug, Clone)]
+pub(crate) struct QueueUnacked {
+    pub(crate) consumer: Option<ConsumerId>,
+    pub(crate) queue: QueueName,
+    pub(crate) message: Message,
+    pub(crate) runtime: Arc<ChannelRuntime>,
+}
+
+/// Consumer and unacknowledged-delivery state owned by one queue task.
+#[derive(Debug, Default)]
+pub(crate) struct QueueConsumerState {
+    pub(crate) consumers: Vec<QueueConsumer>,
+    pub(crate) cursor: Option<ConsumerId>,
+    pub(crate) unacked: BTreeMap<ChannelId, BTreeMap<DeliveryTag, QueueUnacked>>,
+}
+
+impl QueueConsumerState {
+    pub(crate) fn remove_consumer(&mut self, consumer: ConsumerId) -> Option<QueueConsumer> {
+        let index = self
+            .consumers
+            .iter()
+            .position(|candidate| candidate.consumer == consumer)?;
+        let removed = self.consumers.remove(index);
+        if self.cursor == Some(consumer) {
+            self.cursor = None;
+        }
+        Some(removed)
+    }
+
+    pub(crate) fn reserve_next(&mut self) -> Option<QueueConsumer> {
+        let count = self.consumers.len();
+        if count == 0 {
+            return None;
+        }
+
+        let start = self
+            .cursor
+            .and_then(|last| {
+                self.consumers
+                    .iter()
+                    .position(|candidate| candidate.consumer == last)
+            })
+            .map_or(0, |position| (position + 1) % count);
+
+        for offset in 0..count {
+            let index = (start + offset) % count;
+            if self.consumers[index].no_ack {
+                return Some(self.consumers[index].clone());
+            }
+
+            let runtime = Arc::clone(&self.consumers[index].runtime);
+            let limit = runtime.consumer_prefetch.load(Ordering::Acquire);
+            if limit != 0 && self.consumers[index].inflight >= limit {
+                continue;
+            }
+            if !runtime.reserve_channel_slot() {
+                continue;
+            }
+
+            let candidate = &mut self.consumers[index];
+            candidate.inflight += 1;
+            return Some(candidate.clone());
+        }
+
+        None
+    }
+
+    pub(crate) fn record_delivery(
+        &mut self,
+        consumer: &QueueConsumer,
+        queue: QueueName,
+        message: Message,
+    ) -> DeliveryTag {
+        let delivery_tag = consumer.runtime.allocate_tag();
+        if !consumer.no_ack {
+            self.unacked.entry(consumer.channel).or_default().insert(
+                delivery_tag,
+                QueueUnacked {
+                    consumer: Some(consumer.consumer),
+                    queue,
+                    message,
+                    runtime: Arc::clone(&consumer.runtime),
+                },
+            );
+        }
+        self.cursor = Some(consumer.consumer);
+        delivery_tag
+    }
 }
 
 fn available_slots(limit: u32, inflight: u32) -> u32 {
