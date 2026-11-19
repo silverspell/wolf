@@ -89,6 +89,18 @@ pub struct ConsumerCancel {
     pub reason: CancelReason,
 }
 
+/// An event delivered from a queue task to a session's outbox.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeliveryEvent {
+    /// A message delivery for a registered consumer.
+    Delivery(Delivery),
+    /// A server-initiated consumer cancellation.
+    Cancel(ConsumerCancel),
+}
+
+/// The broker-side sender for events handed directly to a session outbox.
+pub type OutboxSender = tokio::sync::mpsc::Sender<DeliveryEvent>;
+
 /// Why a consumer was cancelled.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CancelReason {

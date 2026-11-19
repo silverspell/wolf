@@ -1,10 +1,11 @@
 //! Cross-connection routing of broker deliveries and cancellations.
 //!
 //! A [`DeliveryHub`] maps each broker [`ConsumerId`] to the bounded outbox
-//! channel of the connection that owns it. The broker dispatcher writes through
-//! the hub as a [`DeliverySink`], so a queue consumed on one connection can
-//! receive messages published on another without either connection knowing about
-//! the other. Routes whose receivers have gone away are dropped.
+//! channel of the connection that owns it. Routes are used for consume and
+//! cancel bookkeeping; deliveries captured by a queue task bypass this table and
+//! write directly to the consumer's outbox. The hub also remains a
+//! [`DeliverySink`] fallback for consumers registered without a captured
+//! outbox. Routes whose receivers have gone away are dropped.
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -17,13 +18,7 @@ use wolf_broker::{ConsumerCancel, ConsumerId, DeliverOutcome, Delivery, Delivery
 pub const DEFAULT_OUTBOX_CAPACITY: usize = 256;
 
 /// An event sent from the broker dispatch path to a connection's outbox.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ServerEvent {
-    /// A message delivery for a registered consumer.
-    Delivery(Delivery),
-    /// A server-initiated consumer cancellation.
-    Cancel(ConsumerCancel),
-}
+pub use wolf_broker::DeliveryEvent as ServerEvent;
 
 /// Routes deliveries and cancellations to their owning connection outboxes.
 #[derive(Debug, Clone)]
@@ -151,10 +146,19 @@ impl DeliverySink for DeliveryHubSink {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use bytes::Bytes;
-    use wolf_broker::{CancelReason, ConsumerCancel, ConsumerId, Delivery, DeliveryTag, Message};
+    use tokio::sync::mpsc;
+    use tokio::time::timeout;
+    use wolf_broker::{
+        CancelReason, ChannelId, ConnectionId, ConsumerCancel, ConsumerId, ConsumerOptions,
+        Delivery, DeliveryTag, Message, PublishRequest, QueueConfig, Vhost, VhostId, VhostName,
+    };
 
     use super::*;
+
+    const SAFETY: Duration = Duration::from_secs(10);
 
     fn delivery(consumer: ConsumerId) -> Delivery {
         Delivery {
@@ -272,5 +276,74 @@ mod tests {
         let hub = DeliveryHub::with_capacity(0);
         let (_sender, receiver) = hub.subscribe();
         assert_eq!(receiver.max_capacity(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn dispatch_to_captured_outbox_does_not_lock_the_route_table() {
+        let vhost = Vhost::new(VhostId::new(1), VhostName::new("/").expect("valid vhost"));
+        let connection = ConnectionId::new(1);
+        let channel = ChannelId::new(1);
+        let consumer = ConsumerId::new(1);
+
+        vhost
+            .declare_queue("jobs", QueueConfig::default(), connection)
+            .await
+            .expect("declare queue");
+        let (outbox, mut outbox_rx) = mpsc::channel(4);
+        vhost
+            .consume_with_outbox(
+                connection,
+                channel,
+                consumer,
+                "jobs",
+                ConsumerOptions::default(),
+                outbox,
+            )
+            .await
+            .expect("consume queue");
+        vhost
+            .publish(
+                connection,
+                PublishRequest {
+                    exchange: "",
+                    routing_key: "jobs",
+                    mandatory: false,
+                    message: Message::new(Bytes::from_static(b"payload")),
+                    properties: (),
+                },
+            )
+            .await
+            .expect("publish succeeds");
+
+        let hub = DeliveryHub::new();
+        let routes = Arc::clone(&hub.routes);
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let guard = routes.lock().expect("route table lock is not poisoned");
+            locked_tx.send(()).expect("signal the held route lock");
+            release_rx.recv().expect("wait for the release signal");
+            drop(guard);
+        });
+        locked_rx.recv().expect("the route table is held");
+
+        let dispatched = timeout(SAFETY, vhost.dispatch("jobs", hub.sink()))
+            .await
+            .expect("dispatch must not wait for the route table lock")
+            .expect("dispatch succeeds");
+        assert_eq!(dispatched, 1);
+
+        let event = timeout(SAFETY, outbox_rx.recv())
+            .await
+            .expect("the delivery event arrives within the safety timeout")
+            .expect("the outbox stays open");
+        let ServerEvent::Delivery(delivery) = event else {
+            panic!("expected a delivery event, got {event:?}");
+        };
+        assert_eq!(delivery.consumer, consumer);
+        assert_eq!(delivery.message.body().as_ref(), b"payload");
+
+        release_tx.send(()).expect("release the route table");
+        holder.join().expect("the route lock holder finishes");
     }
 }

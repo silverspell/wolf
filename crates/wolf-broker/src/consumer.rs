@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 use crate::binding::QueueName;
 use crate::delivery::{
     ChannelId, ConsumerId, CreditSignal, DeliverOutcome, Delivery, DeliverySink, DeliveryTag,
+    OutboxSender,
 };
 use crate::error::DomainError;
 use crate::message::Message;
@@ -969,6 +970,7 @@ pub(crate) struct QueueConsumer {
     pub(crate) no_ack: bool,
     pub(crate) credit: Arc<ConsumerCredit>,
     pub(crate) runtime: Arc<ChannelRuntime>,
+    pub(crate) outbox: Option<OutboxSender>,
 }
 
 /// An unacknowledged delivery owned by one queue.

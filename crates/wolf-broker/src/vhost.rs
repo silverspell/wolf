@@ -17,7 +17,7 @@ use crate::consumer::{
 };
 use crate::delivery::{
     CancelReason, ChannelId, ConsumerCancel, ConsumerId, CreditSignal, DeliverOutcome, Delivery,
-    DeliverySink, DeliveryTag,
+    DeliveryEvent, DeliverySink, DeliveryTag, OutboxSender,
 };
 use crate::error::DomainError;
 use crate::exchange::ExchangeConfig;
@@ -229,17 +229,25 @@ async fn deliver_ready<S: DeliverySink>(
                 queue.push_front(message, redelivered);
                 break;
             };
-            Some(Delivery {
+            let delivery = Delivery {
                 consumer: consumer.consumer,
                 delivery_tag,
                 message,
                 redelivered,
-            })
+            };
+            Some((consumer, delivery))
         };
-        let Some(delivery) = next else {
+        let Some((consumer, delivery)) = next else {
             break;
         };
-        if sink.deliver(delivery).await == DeliverOutcome::Closed {
+        let outcome = match &consumer.outbox {
+            Some(outbox) => match outbox.send(DeliveryEvent::Delivery(delivery)).await {
+                Ok(()) => DeliverOutcome::Delivered,
+                Err(_) => DeliverOutcome::Closed,
+            },
+            None => sink.deliver(delivery).await,
+        };
+        if outcome == DeliverOutcome::Closed {
             break;
         }
         delivered += 1;
@@ -489,6 +497,9 @@ impl Vhost {
     }
 
     /// Registers a consumer on a queue.
+    ///
+    /// Deliveries for this consumer use the generic [`DeliverySink`] supplied
+    /// to the queue task at dispatch time.
     pub async fn consume(
         &self,
         connection: ConnectionId,
@@ -496,6 +507,36 @@ impl Vhost {
         consumer: ConsumerId,
         queue: impl AsRef<str>,
         options: ConsumerOptions,
+    ) -> Result<(), DomainError> {
+        self.consume_inner(connection, channel, consumer, queue, options, None)
+            .await
+    }
+
+    /// Registers a consumer and captures its outbox at consume time.
+    ///
+    /// The queue task writes deliveries directly to this sender, so the
+    /// delivery hot path does not need to consult a route table.
+    pub async fn consume_with_outbox(
+        &self,
+        connection: ConnectionId,
+        channel: ChannelId,
+        consumer: ConsumerId,
+        queue: impl AsRef<str>,
+        options: ConsumerOptions,
+        outbox: OutboxSender,
+    ) -> Result<(), DomainError> {
+        self.consume_inner(connection, channel, consumer, queue, options, Some(outbox))
+            .await
+    }
+
+    async fn consume_inner(
+        &self,
+        connection: ConnectionId,
+        channel: ChannelId,
+        consumer: ConsumerId,
+        queue: impl AsRef<str>,
+        options: ConsumerOptions,
+        outbox: Option<OutboxSender>,
     ) -> Result<(), DomainError> {
         let slot = self.slot(queue.as_ref())?;
         if self
@@ -545,6 +586,7 @@ impl Vhost {
                 no_ack: options.no_ack,
                 credit,
                 runtime: Arc::clone(&runtime),
+                outbox,
             });
         }
 

@@ -1,9 +1,11 @@
 //! Handlers for `basic.qos`, `basic.consume`, `basic.cancel` and deliveries.
 //!
 //! Consumer state is split between the protocol-neutral broker dispatcher and
-//! the connection's [`ConsumerDirectory`]. Deliveries route through the
-//! connection [`DeliveryHub`], so a message published on any connection can be
-//! delivered to its consumer's owning connection.
+//! the connection's [`ConsumerDirectory`]. The outbox sender is captured by the
+//! queue task at consume time, so deliveries write directly to the consumer's
+//! owning connection outbox without consulting the route table. The
+//! [`DeliveryHub`] still tracks routes for consume and cancel bookkeeping and
+//! remains the fallback sink for consumers without a captured outbox.
 
 use bytes::Bytes;
 use tokio::sync::mpsc::Sender;
@@ -96,7 +98,7 @@ pub async fn consume(
     }
 
     vhost
-        .consume(
+        .consume_with_outbox(
             connection,
             broker_channel,
             consumer,
@@ -104,6 +106,7 @@ pub async fn consume(
             ConsumerOptions {
                 no_ack: request.no_ack,
             },
+            outbox.clone(),
         )
         .await
         .map_err(|error| basic_error(&error, basic_consume::CONSUME))?;
