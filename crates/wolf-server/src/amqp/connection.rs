@@ -1212,7 +1212,7 @@ pub fn capabilities() -> FieldTable {
 
 #[cfg(test)]
 mod tests {
-    use wolf_amqp_codec::{ChannelOpen, FieldTable, FieldValue, ShortString};
+    use wolf_amqp_codec::{ChannelOpen, FieldTable, FieldValue, Open, QueueDeclare, ShortString};
     use wolf_broker::{Vhost, VhostId, VhostName};
 
     use super::*;
@@ -1353,5 +1353,90 @@ mod tests {
             .await
             .expect_err("flow false is unsupported");
         assert_eq!(error.reply_code, ReplyCode::NotImplemented);
+    }
+
+    #[tokio::test]
+    async fn cleanup_connection_unregisters_captured_outbox_routes() {
+        let hub = Arc::new(DeliveryHub::new());
+        let (outbox, _receiver) = hub.subscribe();
+        let mut connection = Connection::with_delivery(
+            "127.0.0.1:1234".parse().expect("valid address"),
+            test_broker(),
+            Arc::new(Account::guest()),
+            BrokerConnectionId::new(1),
+            Arc::clone(&hub),
+            outbox,
+        );
+
+        connection.handle_frame(start_ok()).await.expect("start-ok");
+        connection
+            .handle_frame(Frame::Method {
+                channel: 0,
+                method: Method::Connection(ConnectionMethod::TuneOk(TuneOk {
+                    channel_max: 0,
+                    frame_max: 0,
+                    heartbeat: 0,
+                })),
+            })
+            .await
+            .expect("tune-ok");
+        connection
+            .handle_frame(Frame::Method {
+                channel: 0,
+                method: Method::Connection(ConnectionMethod::Open(Open {
+                    virtual_host: ShortString::new("/"),
+                    capabilities: ShortString::new(""),
+                    insist: false,
+                })),
+            })
+            .await
+            .expect("open");
+        connection
+            .handle_frame(Frame::Method {
+                channel: 1,
+                method: Method::Channel(ChannelMethod::Open(ChannelOpen {
+                    out_of_band: ShortString::new(""),
+                })),
+            })
+            .await
+            .expect("channel open");
+        connection
+            .handle_frame(Frame::Method {
+                channel: 1,
+                method: Method::Queue(QueueMethod::Declare(QueueDeclare {
+                    ticket: 0,
+                    queue: ShortString::new("jobs"),
+                    passive: false,
+                    durable: false,
+                    exclusive: false,
+                    auto_delete: false,
+                    nowait: false,
+                    arguments: FieldTable::new(),
+                })),
+            })
+            .await
+            .expect("queue declare");
+        connection
+            .handle_frame(Frame::Method {
+                channel: 1,
+                method: Method::Basic(BasicMethod::Consume(BasicConsume {
+                    ticket: 0,
+                    queue: ShortString::new("jobs"),
+                    consumer_tag: ShortString::new("ctag"),
+                    no_local: false,
+                    no_ack: false,
+                    exclusive: false,
+                    nowait: false,
+                    arguments: FieldTable::new(),
+                })),
+            })
+            .await
+            .expect("basic.consume");
+
+        assert_eq!(hub.route_count(), 1);
+
+        connection.cleanup_connection().await;
+
+        assert_eq!(hub.route_count(), 0);
     }
 }

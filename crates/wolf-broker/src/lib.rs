@@ -17,6 +17,8 @@ pub mod publish;
 pub mod queue;
 pub mod router;
 pub mod stream;
+#[cfg(feature = "test-hooks")]
+pub mod test_hooks;
 pub mod topic;
 pub mod validation;
 pub mod vhost;
@@ -26,7 +28,7 @@ pub use broker::Broker;
 pub use consumer::{ConsumerDispatcher, ConsumerOptions, SettleOutcome};
 pub use delivery::{
     CancelReason, ChannelId, ConsumerCancel, ConsumerId, CreditReceiver, CreditSignal,
-    DeliverOutcome, Delivery, DeliverySink, DeliveryTag,
+    DeliverOutcome, Delivery, DeliveryEvent, DeliverySink, DeliveryTag, OutboxSender,
 };
 pub use error::{DomainError, ResourceKind};
 pub use exchange::{
@@ -41,6 +43,8 @@ pub use publish::{
 pub use queue::{
     ConnectionCloseOutcome, ConnectionId, Queue, QueueConfig, QueueDeleteOutcome, QueueRegistry,
 };
+#[cfg(feature = "test-hooks")]
+pub use test_hooks::{AckPauseHandle, AckPauseHook};
 pub use topic::{RoutingKey, TopicPattern, TopicTrie};
 pub use validation::{QueueArguments, UNSUPPORTED_QUEUE_ARGUMENTS, validate_queue_arguments};
 pub use vhost::{

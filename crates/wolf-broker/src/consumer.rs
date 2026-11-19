@@ -6,23 +6,18 @@
 //! unacknowledged messages with the redelivered flag set.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crate::binding::QueueName;
 use crate::delivery::{
     ChannelId, ConsumerId, CreditSignal, DeliverOutcome, Delivery, DeliverySink, DeliveryTag,
+    OutboxSender,
 };
 use crate::error::DomainError;
 use crate::message::Message;
 use crate::publish::{GetOutcome, get_message};
 use crate::queue::{ConnectionCloseOutcome, ConnectionId, Queue, QueueRegistry};
-
-/// The result of closing a channel: settlement, entries to requeue, and the
-/// consumers whose queue membership must be removed by the caller.
-pub(crate) type ChannelClose = (
-    SettleOutcome,
-    Vec<(QueueName, Message)>,
-    Vec<(ConsumerId, QueueName)>,
-);
 
 /// Options that affect how a consumer receives messages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -513,253 +508,6 @@ impl ConsumerDispatcher {
             .map_or(0, |state| state.unacked.len())
     }
 
-    /// Returns whether a consumer is registered in the dispatcher.
-    pub(crate) fn contains_consumer(&self, consumer: ConsumerId) -> bool {
-        self.consumers.contains_key(&consumer)
-    }
-
-    /// Records a consumer whose queue membership is owned by the caller.
-    pub(crate) fn register_detached(
-        &mut self,
-        connection: ConnectionId,
-        channel: ChannelId,
-        consumer: ConsumerId,
-        queue: QueueName,
-        options: ConsumerOptions,
-    ) -> Result<(), DomainError> {
-        if self.consumers.contains_key(&consumer) {
-            return Err(DomainError::InvalidArgument {
-                message: format!("consumer {} is already registered", consumer.get()),
-            });
-        }
-
-        self.consumers.insert(
-            consumer,
-            ConsumerState {
-                connection,
-                channel,
-                queue,
-                inflight: 0,
-                no_ack: options.no_ack,
-            },
-        );
-        let state = self.channels.entry(channel).or_default();
-        state.connection = Some(connection);
-        state.consumers.insert(consumer);
-        Ok(())
-    }
-
-    /// Removes a consumer from the dispatcher without touching its queue.
-    pub(crate) fn detach_consumer(&mut self, consumer: ConsumerId) -> Option<QueueName> {
-        let state = self.consumers.remove(&consumer)?;
-        if let Some(channel) = self.channels.get_mut(&state.channel) {
-            channel.consumers.remove(&consumer);
-        }
-        self.cursors.retain(|_, current| *current != consumer);
-        Some(state.queue)
-    }
-
-    /// Takes at most one ready message from a queue and records the delivery.
-    pub(crate) fn take_next_delivery(&mut self, queue: &mut Queue) -> Option<Delivery> {
-        if queue.is_empty() {
-            return None;
-        }
-        let consumer = self.next_consumer(queue.name().as_str(), queue)?;
-        let (message, redelivered) = queue.take_front()?;
-        let delivery_tag = self.record_delivery(consumer, message.clone());
-        Some(Delivery {
-            consumer,
-            delivery_tag,
-            message,
-            redelivered,
-        })
-    }
-
-    /// Fetches one message from a queue the caller owns.
-    pub(crate) fn get_detached(
-        &mut self,
-        connection: ConnectionId,
-        channel: ChannelId,
-        queue: &mut Queue,
-        no_ack: bool,
-    ) -> Result<GetOutcome, DomainError> {
-        queue.check_access(connection)?;
-        let Some((message, redelivered)) = queue.take_front() else {
-            return Ok(GetOutcome::Empty);
-        };
-
-        let remaining = queue.message_count();
-        let ack_state = if no_ack {
-            crate::publish::AckState::NotRequired
-        } else {
-            crate::publish::AckState::Required
-        };
-
-        let state = self.channels.entry(channel).or_default();
-        state.connection = Some(connection);
-        let delivery_tag = state.allocate_tag();
-        if !no_ack {
-            state.inflight += 1;
-            state.unacked.insert(
-                delivery_tag,
-                Unacked {
-                    consumer: None,
-                    queue: queue.name().clone(),
-                    message: message.clone(),
-                },
-            );
-        }
-
-        Ok(GetOutcome::Message(crate::publish::GetMessage {
-            message,
-            redelivered,
-            ack_state,
-            remaining,
-            delivery_tag: Some(delivery_tag),
-        }))
-    }
-
-    /// Settles deliveries without requeueing them, returning the entries that
-    /// the caller must requeue.
-    pub(crate) fn settle_detached(
-        &mut self,
-        channel: ChannelId,
-        delivery_tag: DeliveryTag,
-        multiple: bool,
-        requeue: bool,
-    ) -> Result<(SettleOutcome, Vec<(QueueName, Message)>), DomainError> {
-        let tags = self.selected_tags(channel, delivery_tag, multiple)?;
-        let removed = self.remove_unacked(channel, &tags);
-        let settled = removed.len();
-        let credit = self.credit_for_removed(channel, &removed);
-        let entries = if requeue {
-            entries_to_pairs(removed)
-        } else {
-            Vec::new()
-        };
-        Ok((
-            SettleOutcome {
-                settled,
-                requeued: 0,
-                credit,
-            },
-            entries,
-        ))
-    }
-
-    /// Requeues every unacknowledged delivery on a channel, returning the
-    /// entries for the caller to place back into their queues.
-    pub(crate) fn recover_detached(
-        &mut self,
-        channel: ChannelId,
-    ) -> (SettleOutcome, Vec<(QueueName, Message)>) {
-        let tags: Vec<DeliveryTag> = self
-            .channels
-            .get(&channel)
-            .map(|state| state.unacked.keys().copied().collect())
-            .unwrap_or_default();
-        if tags.is_empty() {
-            return (SettleOutcome::default(), Vec::new());
-        }
-
-        let removed = self.remove_unacked(channel, &tags);
-        let settled = removed.len();
-        let credit = self.credit_for_removed(channel, &removed);
-        let entries = entries_to_pairs(removed);
-        (
-            SettleOutcome {
-                settled,
-                requeued: 0,
-                credit,
-            },
-            entries,
-        )
-    }
-
-    /// Closes a channel, returning requeued entries and removed consumers.
-    pub(crate) fn close_channel_detached(&mut self, channel: ChannelId) -> ChannelClose {
-        let Some(state) = self.channels.get(&channel) else {
-            return (SettleOutcome::default(), Vec::new(), Vec::new());
-        };
-        let consumers: Vec<ConsumerId> = state.consumers.iter().copied().collect();
-        let tags: Vec<DeliveryTag> = state.unacked.keys().copied().collect();
-        let consumers: Vec<(ConsumerId, QueueName)> = consumers
-            .into_iter()
-            .filter_map(|consumer| {
-                self.consumers
-                    .get(&consumer)
-                    .map(|state| (consumer, state.queue.clone()))
-            })
-            .collect();
-
-        let removed = self.remove_unacked(channel, &tags);
-        let settled = removed.len();
-
-        for (consumer, _) in &consumers {
-            self.consumers.remove(consumer);
-            self.cursors.retain(|_, current| current != consumer);
-        }
-        self.channels.remove(&channel);
-
-        (
-            SettleOutcome {
-                settled,
-                requeued: 0,
-                credit: Vec::new(),
-            },
-            entries_to_pairs(removed),
-            consumers,
-        )
-    }
-
-    /// Closes a connection, returning requeued entries and removed consumers.
-    pub(crate) fn close_connection_detached(
-        &mut self,
-        connection: ConnectionId,
-    ) -> (Vec<(QueueName, Message)>, Vec<ConsumerId>) {
-        let channels: Vec<ChannelId> = self
-            .channels
-            .iter()
-            .filter(|(_, state)| state.connection == Some(connection))
-            .map(|(channel, _)| *channel)
-            .collect();
-
-        let mut requeued = Vec::new();
-        for channel in &channels {
-            let tags: Vec<DeliveryTag> = self
-                .channels
-                .get(channel)
-                .map(|state| state.unacked.keys().copied().collect())
-                .unwrap_or_default();
-            if !tags.is_empty() {
-                requeued.extend(self.remove_unacked(*channel, &tags));
-            }
-        }
-
-        let consumers: Vec<ConsumerId> = self
-            .consumers
-            .iter()
-            .filter(|(_, state)| state.connection == connection)
-            .map(|(consumer, _)| *consumer)
-            .collect();
-
-        for consumer in &consumers {
-            if let Some(state) = self.consumers.remove(consumer) {
-                if let Some(channel) = self.channels.get_mut(&state.channel) {
-                    channel.consumers.remove(consumer);
-                }
-            }
-        }
-        self.cursors
-            .retain(|_, consumer| !consumers.contains(consumer));
-
-        for channel in channels {
-            self.channels.remove(&channel);
-        }
-
-        (entries_to_pairs(requeued), consumers)
-    }
-
     fn next_consumer(&self, queue_name: &str, queue: &Queue) -> Option<ConsumerId> {
         let count = queue.consumer_count();
         if count == 0 {
@@ -941,11 +689,388 @@ impl ConsumerDispatcher {
     }
 }
 
-fn entries_to_pairs(entries: Vec<Unacked>) -> Vec<(QueueName, Message)> {
-    entries
-        .into_iter()
-        .map(|entry| (entry.queue, entry.message))
-        .collect()
+/// Per-consumer prefetch credit, shared by queue state and the channel index.
+#[derive(Debug)]
+pub(crate) struct ConsumerCredit {
+    pub(crate) consumer: ConsumerId,
+    pub(crate) queue: QueueName,
+    pub(crate) inflight: AtomicU32,
+}
+
+impl ConsumerCredit {
+    pub(crate) fn new(consumer: ConsumerId, queue: QueueName) -> Self {
+        Self {
+            consumer,
+            queue,
+            inflight: AtomicU32::new(0),
+        }
+    }
+
+    pub(crate) fn inflight(&self) -> u32 {
+        self.inflight.load(Ordering::Acquire)
+    }
+}
+
+/// A channel-scoped unacknowledged delivery.
+///
+/// Message bodies live in the owning queue's state; this only records which
+/// queue the tag belongs to and which consumer credit must be released when the
+/// tag is claimed.
+#[derive(Debug, Clone)]
+pub(crate) struct ChannelUnacked {
+    pub(crate) queue: QueueName,
+    pub(crate) credit: Option<Arc<ConsumerCredit>>,
+}
+
+/// Delivery tags and consumer credits owned by one channel.
+#[derive(Debug, Default)]
+pub(crate) struct ChannelIndex {
+    pub(crate) consumers: BTreeMap<ConsumerId, Arc<ConsumerCredit>>,
+    pub(crate) unacked: BTreeMap<DeliveryTag, ChannelUnacked>,
+}
+
+/// Shared per-channel runtime used by queue-owned consumer state.
+///
+/// Delivery tags and prefetch accounting are channel-wide, while the consumers
+/// and unacknowledged deliveries that use them are split across queue tasks.
+#[derive(Debug)]
+pub(crate) struct ChannelRuntime {
+    connection: Mutex<Option<ConnectionId>>,
+    pub(crate) consumer_prefetch: AtomicU32,
+    pub(crate) channel_prefetch: AtomicU32,
+    pub(crate) inflight: AtomicU32,
+    next_tag: AtomicU64,
+    index: Mutex<ChannelIndex>,
+    closed: AtomicBool,
+}
+
+impl ChannelRuntime {
+    pub(crate) fn new(connection: Option<ConnectionId>) -> Self {
+        Self {
+            connection: Mutex::new(connection),
+            consumer_prefetch: AtomicU32::new(0),
+            channel_prefetch: AtomicU32::new(0),
+            inflight: AtomicU32::new(0),
+            next_tag: AtomicU64::new(1),
+            index: Mutex::new(ChannelIndex::default()),
+            closed: AtomicBool::new(false),
+        }
+    }
+
+    pub(crate) fn connection(&self) -> Option<ConnectionId> {
+        self.connection
+            .lock()
+            .map(|connection| *connection)
+            .unwrap_or(None)
+    }
+
+    pub(crate) fn set_connection(&self, connection: ConnectionId) {
+        if let Ok(mut current) = self.connection.lock() {
+            *current = Some(connection);
+        }
+    }
+
+    /// Marks the channel closed so no new deliveries enter its index.
+    pub(crate) fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn allocate_tag(&self) -> DeliveryTag {
+        let mut current = self.next_tag.load(Ordering::Relaxed);
+        loop {
+            let next = if current == u64::MAX { 1 } else { current + 1 };
+            match self.next_tag.compare_exchange_weak(
+                current,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return DeliveryTag::new(current),
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    /// Reserves one consumer credit slot and one channel-wide slot.
+    ///
+    /// Rolls back the consumer count if either the per-consumer limit or the
+    /// channel limit rejects the reservation.
+    pub(crate) fn try_reserve(&self, credit: &ConsumerCredit) -> bool {
+        if self.closed.load(Ordering::Acquire) {
+            return false;
+        }
+
+        let previous = credit.inflight.fetch_add(1, Ordering::AcqRel);
+        let limit = self.consumer_prefetch.load(Ordering::Acquire);
+        if limit != 0 && previous >= limit {
+            credit.inflight.fetch_sub(1, Ordering::AcqRel);
+            return false;
+        }
+        if !self.reserve_channel_slot() {
+            credit.inflight.fetch_sub(1, Ordering::AcqRel);
+            return false;
+        }
+        true
+    }
+
+    /// Releases one reservation made by [`Self::try_reserve`].
+    pub(crate) fn release(&self, credit: Option<&ConsumerCredit>) {
+        if let Some(credit) = credit {
+            let mut current = credit.inflight.load(Ordering::Acquire);
+            loop {
+                if current == 0 {
+                    break;
+                }
+                match credit.inflight.compare_exchange_weak(
+                    current,
+                    current - 1,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => break,
+                    Err(actual) => current = actual,
+                }
+            }
+        }
+        self.release_channel_slot();
+    }
+
+    pub(crate) fn reserve_channel_slot(&self) -> bool {
+        let limit = self.channel_prefetch.load(Ordering::Acquire);
+        loop {
+            let current = self.inflight.load(Ordering::Acquire);
+            if limit != 0 && current >= limit {
+                return false;
+            }
+            match self.inflight.compare_exchange_weak(
+                current,
+                current.saturating_add(1),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(_) => continue,
+            }
+        }
+    }
+
+    pub(crate) fn release_channel_slot(&self) {
+        loop {
+            let current = self.inflight.load(Ordering::Acquire);
+            let next = current.saturating_sub(1);
+            match self.inflight.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(_) => continue,
+            }
+        }
+    }
+
+    /// Reserves a channel slot for `basic.get`, which is not prefetch-limited.
+    pub(crate) fn reserve_get_slot(&self) {
+        self.inflight.fetch_add(1, Ordering::AcqRel);
+    }
+
+    pub(crate) fn consumer_credit(&self, inflight: u32) -> u32 {
+        let limit = self.consumer_prefetch.load(Ordering::Acquire);
+        available_slots(limit, inflight)
+    }
+
+    pub(crate) fn channel_credit(&self) -> u32 {
+        let limit = self.channel_prefetch.load(Ordering::Acquire);
+        available_slots(limit, self.inflight.load(Ordering::Acquire))
+    }
+
+    pub(crate) fn insert_unacked(&self, tag: DeliveryTag, entry: ChannelUnacked) -> bool {
+        let Ok(mut index) = self.index.lock() else {
+            return false;
+        };
+        if self.closed.load(Ordering::Acquire) {
+            return false;
+        }
+        index.unacked.insert(tag, entry);
+        true
+    }
+
+    pub(crate) fn claim_tag(&self, tag: DeliveryTag) -> Option<ChannelUnacked> {
+        self.index.lock().ok()?.unacked.remove(&tag)
+    }
+
+    pub(crate) fn claim_tag_if_present(&self, tag: DeliveryTag) -> Option<ChannelUnacked> {
+        self.claim_tag(tag)
+    }
+
+    /// Claims every tag up to and including `tag`, in ascending tag order.
+    ///
+    /// The exact cut tag must already be present, otherwise nothing is claimed.
+    pub(crate) fn claim_range(
+        &self,
+        tag: DeliveryTag,
+    ) -> Option<Vec<(DeliveryTag, ChannelUnacked)>> {
+        let mut index = self.index.lock().ok()?;
+        if !index.unacked.contains_key(&tag) {
+            return None;
+        }
+        let tags: Vec<DeliveryTag> = index.unacked.range(..=tag).map(|(tag, _)| *tag).collect();
+        let mut claimed = Vec::with_capacity(tags.len());
+        for tag in tags {
+            if let Some(entry) = index.unacked.remove(&tag) {
+                claimed.push((tag, entry));
+            }
+        }
+        Some(claimed)
+    }
+
+    pub(crate) fn claim_all(&self) -> Vec<(DeliveryTag, ChannelUnacked)> {
+        match self.index.lock() {
+            Ok(mut index) => std::mem::take(&mut index.unacked).into_iter().collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    pub(crate) fn register_consumer(&self, credit: Arc<ConsumerCredit>) -> bool {
+        let Ok(mut index) = self.index.lock() else {
+            return false;
+        };
+        if self.closed.load(Ordering::Acquire) || index.consumers.contains_key(&credit.consumer) {
+            return false;
+        }
+        index.consumers.insert(credit.consumer, credit);
+        true
+    }
+
+    pub(crate) fn remove_consumer(&self, consumer: ConsumerId) -> Option<Arc<ConsumerCredit>> {
+        self.index.lock().ok()?.consumers.remove(&consumer)
+    }
+
+    pub(crate) fn take_consumers(&self) -> Vec<Arc<ConsumerCredit>> {
+        match self.index.lock() {
+            Ok(mut index) => std::mem::take(&mut index.consumers).into_values().collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    pub(crate) fn consumer_credits(&self) -> Vec<Arc<ConsumerCredit>> {
+        match self.index.lock() {
+            Ok(index) => index.consumers.values().cloned().collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+}
+
+/// A consumer registered on one queue, in queue registration order.
+#[derive(Debug, Clone)]
+pub(crate) struct QueueConsumer {
+    pub(crate) consumer: ConsumerId,
+    pub(crate) channel: ChannelId,
+    pub(crate) no_ack: bool,
+    pub(crate) credit: Arc<ConsumerCredit>,
+    pub(crate) runtime: Arc<ChannelRuntime>,
+    pub(crate) outbox: Option<OutboxSender>,
+}
+
+/// An unacknowledged delivery owned by one queue.
+#[derive(Debug, Clone)]
+pub(crate) struct QueueUnacked {
+    pub(crate) queue: QueueName,
+    pub(crate) message: Message,
+    pub(crate) runtime: Arc<ChannelRuntime>,
+}
+
+/// Consumer and unacknowledged-delivery state owned by one queue task.
+#[derive(Debug, Default)]
+pub(crate) struct QueueConsumerState {
+    pub(crate) consumers: Vec<QueueConsumer>,
+    pub(crate) cursor: Option<ConsumerId>,
+    pub(crate) unacked: BTreeMap<ChannelId, BTreeMap<DeliveryTag, QueueUnacked>>,
+}
+
+impl QueueConsumerState {
+    pub(crate) fn remove_consumer(&mut self, consumer: ConsumerId) -> Option<QueueConsumer> {
+        let index = self
+            .consumers
+            .iter()
+            .position(|candidate| candidate.consumer == consumer)?;
+        let removed = self.consumers.remove(index);
+        if self.cursor == Some(consumer) {
+            self.cursor = None;
+        }
+        Some(removed)
+    }
+
+    pub(crate) fn reserve_next(&mut self) -> Option<QueueConsumer> {
+        let count = self.consumers.len();
+        if count == 0 {
+            return None;
+        }
+
+        let start = self
+            .cursor
+            .and_then(|last| {
+                self.consumers
+                    .iter()
+                    .position(|candidate| candidate.consumer == last)
+            })
+            .map_or(0, |position| (position + 1) % count);
+
+        for offset in 0..count {
+            let index = (start + offset) % count;
+            let candidate = &self.consumers[index];
+            if candidate.no_ack {
+                return Some(candidate.clone());
+            }
+            if !candidate.runtime.try_reserve(&candidate.credit) {
+                continue;
+            }
+            return Some(candidate.clone());
+        }
+
+        None
+    }
+
+    /// Records a delivery in the channel index first, then in the queue.
+    ///
+    /// Returns `None` if the channel closed before the index insert could be
+    /// made; the caller must return the message to the queue. The reservation
+    /// made by [`Self::reserve_next`] is released in that case.
+    pub(crate) fn record_delivery(
+        &mut self,
+        consumer: &QueueConsumer,
+        queue: QueueName,
+        message: Message,
+    ) -> Option<DeliveryTag> {
+        let delivery_tag = consumer.runtime.allocate_tag();
+        if consumer.no_ack {
+            self.cursor = Some(consumer.consumer);
+            return Some(delivery_tag);
+        }
+
+        if !consumer.runtime.insert_unacked(
+            delivery_tag,
+            ChannelUnacked {
+                queue: queue.clone(),
+                credit: Some(Arc::clone(&consumer.credit)),
+            },
+        ) {
+            consumer.runtime.release(Some(&consumer.credit));
+            return None;
+        }
+
+        self.unacked.entry(consumer.channel).or_default().insert(
+            delivery_tag,
+            QueueUnacked {
+                queue,
+                message,
+                runtime: Arc::clone(&consumer.runtime),
+            },
+        );
+        self.cursor = Some(consumer.consumer);
+        Some(delivery_tag)
+    }
 }
 
 fn available_slots(limit: u32, inflight: u32) -> u32 {
@@ -980,5 +1105,105 @@ fn unknown_delivery_tag(channel: ChannelId, delivery_tag: DeliveryTag) -> Domain
             delivery_tag.get(),
             channel.get()
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn new_runtime() -> ChannelRuntime {
+        ChannelRuntime::new(None)
+    }
+
+    fn credit(consumer: u64, queue: &str) -> Arc<ConsumerCredit> {
+        Arc::new(ConsumerCredit::new(
+            ConsumerId::new(consumer),
+            QueueName::new(queue).expect("valid queue name"),
+        ))
+    }
+
+    fn entry(queue: &str, credit: Option<Arc<ConsumerCredit>>) -> ChannelUnacked {
+        ChannelUnacked {
+            queue: QueueName::new(queue).expect("valid queue name"),
+            credit,
+        }
+    }
+
+    #[test]
+    fn delivery_tags_wrap_from_max_to_one() {
+        let runtime = new_runtime();
+        runtime.next_tag.store(u64::MAX, Ordering::Relaxed);
+
+        assert_eq!(runtime.allocate_tag(), DeliveryTag::new(u64::MAX));
+        assert_eq!(runtime.allocate_tag(), DeliveryTag::new(1));
+    }
+
+    #[test]
+    fn try_reserve_enforces_consumer_and_channel_limits_and_rolls_back() {
+        let runtime = new_runtime();
+        let only = credit(1, "q");
+        runtime.consumer_prefetch.store(1, Ordering::Release);
+
+        assert!(runtime.try_reserve(&only));
+        assert!(!runtime.try_reserve(&only));
+        assert_eq!(only.inflight(), 1);
+        assert_eq!(runtime.inflight.load(Ordering::Acquire), 1);
+
+        runtime.release(Some(&only));
+        assert_eq!(only.inflight(), 0);
+        assert_eq!(runtime.inflight.load(Ordering::Acquire), 0);
+        assert!(runtime.try_reserve(&only));
+
+        let runtime = new_runtime();
+        let first = credit(1, "q");
+        let second = credit(2, "q");
+        runtime.channel_prefetch.store(1, Ordering::Release);
+
+        assert!(runtime.try_reserve(&first));
+        assert!(!runtime.try_reserve(&second));
+        assert_eq!(second.inflight(), 0);
+        assert_eq!(runtime.inflight.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn insert_unacked_fails_after_close() {
+        let runtime = new_runtime();
+        assert!(runtime.insert_unacked(DeliveryTag::new(1), entry("q", None)));
+
+        runtime.close();
+        assert!(!runtime.insert_unacked(DeliveryTag::new(2), entry("q", None)));
+
+        assert!(runtime.claim_tag(DeliveryTag::new(1)).is_some());
+        assert!(runtime.claim_tag(DeliveryTag::new(1)).is_none());
+    }
+
+    #[test]
+    fn claim_range_returns_ascending_tags_and_requires_the_cut_tag() {
+        let runtime = new_runtime();
+        for tag in [1, 2, 3, 5] {
+            assert!(runtime.insert_unacked(DeliveryTag::new(tag), entry("q", None)));
+        }
+
+        assert!(runtime.claim_range(DeliveryTag::new(4)).is_none());
+
+        let claimed = runtime
+            .claim_range(DeliveryTag::new(3))
+            .expect("the cut tag is present");
+        assert_eq!(
+            claimed.iter().map(|(tag, _)| *tag).collect::<Vec<_>>(),
+            vec![
+                DeliveryTag::new(1),
+                DeliveryTag::new(2),
+                DeliveryTag::new(3)
+            ]
+        );
+
+        let remaining = runtime.claim_all();
+        assert_eq!(
+            remaining.iter().map(|(tag, _)| *tag).collect::<Vec<_>>(),
+            vec![DeliveryTag::new(5)]
+        );
+        assert!(runtime.claim_tag(DeliveryTag::new(5)).is_none());
     }
 }

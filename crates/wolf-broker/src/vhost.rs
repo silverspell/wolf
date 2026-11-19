@@ -11,19 +11,24 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::binding::QueueName;
-use crate::consumer::{ConsumerDispatcher, ConsumerOptions, SettleOutcome};
+use crate::consumer::{
+    ChannelRuntime, ChannelUnacked, ConsumerCredit, ConsumerOptions, QueueConsumer,
+    QueueConsumerState, QueueUnacked, SettleOutcome,
+};
 use crate::delivery::{
-    CancelReason, ChannelId, ConsumerCancel, ConsumerId, CreditSignal, DeliverOutcome,
-    DeliverySink, DeliveryTag,
+    CancelReason, ChannelId, ConsumerCancel, ConsumerId, CreditSignal, DeliverOutcome, Delivery,
+    DeliveryEvent, DeliverySink, DeliveryTag, OutboxSender,
 };
 use crate::error::DomainError;
 use crate::exchange::ExchangeConfig;
 use crate::message::Message;
-use crate::publish::{GetOutcome, PublishOutcome, PublishRequest, Returned};
+use crate::publish::{AckState, GetMessage, GetOutcome, PublishOutcome, PublishRequest, Returned};
 use crate::queue::{
     ConnectionCloseOutcome, ConnectionId, Queue, QueueConfig, QueueDeleteOutcome, QueueRegistry,
 };
 use crate::router::Router;
+#[cfg(feature = "test-hooks")]
+use crate::test_hooks::AckPauseHook;
 use crate::validation::validate_queue_arguments;
 
 /// A validated virtual host name.
@@ -65,8 +70,6 @@ impl VhostId {
         self.0
     }
 }
-
-type Dispatcher = Arc<Mutex<ConsumerDispatcher>>;
 
 /// A dispatch future owned by a queue task.
 type DispatchFuture = Pin<Box<dyn Future<Output = Result<usize, DomainError>> + Send + 'static>>;
@@ -120,20 +123,20 @@ enum QueueCommand {
 
 struct QueueSlot {
     queue: Arc<Mutex<Queue>>,
+    consumers: Arc<Mutex<QueueConsumerState>>,
     sender: mpsc::Sender<QueueCommand>,
     receiver: Mutex<Option<mpsc::Receiver<QueueCommand>>>,
-    dispatcher: Dispatcher,
     task: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl QueueSlot {
-    fn new(queue: Queue, dispatcher: Dispatcher, capacity: usize) -> Self {
+    fn new(queue: Queue, capacity: usize) -> Self {
         let (sender, receiver) = mpsc::channel(capacity);
         Self {
             queue: Arc::new(Mutex::new(queue)),
+            consumers: Arc::new(Mutex::new(QueueConsumerState::default())),
             sender,
             receiver: Mutex::new(Some(receiver)),
-            dispatcher,
             task: Mutex::new(None),
         }
     }
@@ -194,28 +197,57 @@ fn enqueue_message(
 
 fn dispatch_future<S: DeliverySink + Send + 'static>(
     queue: Arc<Mutex<Queue>>,
-    dispatcher: Dispatcher,
+    consumers: Arc<Mutex<QueueConsumerState>>,
     sink: S,
 ) -> DispatchFuture {
-    Box::pin(async move { deliver_ready(&queue, &dispatcher, sink).await })
+    Box::pin(async move { deliver_ready(&queue, &consumers, sink).await })
 }
 
 async fn deliver_ready<S: DeliverySink>(
     queue: &Mutex<Queue>,
-    dispatcher: &Mutex<ConsumerDispatcher>,
+    consumers: &Mutex<QueueConsumerState>,
     mut sink: S,
 ) -> Result<usize, DomainError> {
     let mut delivered = 0;
     loop {
         let next = {
-            let mut dispatcher = dispatcher.lock().map_err(|_| DomainError::BrokerClosed)?;
             let mut queue = queue.lock().map_err(|_| DomainError::BrokerClosed)?;
-            dispatcher.take_next_delivery(&mut queue)
+            if queue.is_empty() {
+                break;
+            }
+            let mut consumers = consumers.lock().map_err(|_| DomainError::BrokerClosed)?;
+            let Some(consumer) = consumers.reserve_next() else {
+                break;
+            };
+            let (message, redelivered) = queue
+                .take_front()
+                .expect("a non-empty queue has a front message");
+            let queue_name = queue.name().clone();
+            let Some(delivery_tag) =
+                consumers.record_delivery(&consumer, queue_name, message.clone())
+            else {
+                queue.push_front(message, redelivered);
+                break;
+            };
+            let delivery = Delivery {
+                consumer: consumer.consumer,
+                delivery_tag,
+                message,
+                redelivered,
+            };
+            Some((consumer, delivery))
         };
-        let Some(delivery) = next else {
+        let Some((consumer, delivery)) = next else {
             break;
         };
-        if sink.deliver(delivery).await == DeliverOutcome::Closed {
+        let outcome = match &consumer.outbox {
+            Some(outbox) => match outbox.send(DeliveryEvent::Delivery(delivery)).await {
+                Ok(()) => DeliverOutcome::Delivered,
+                Err(_) => DeliverOutcome::Closed,
+            },
+            None => sink.deliver(delivery).await,
+        };
+        if outcome == DeliverOutcome::Closed {
             break;
         }
         delivered += 1;
@@ -228,10 +260,13 @@ pub struct Vhost {
     id: VhostId,
     name: VhostName,
     router: RwLock<Router>,
-    queues: Mutex<BTreeMap<QueueName, Arc<QueueSlot>>>,
-    dispatcher: Dispatcher,
+    queues: RwLock<BTreeMap<QueueName, Arc<QueueSlot>>>,
+    channels: RwLock<BTreeMap<ChannelId, Arc<ChannelRuntime>>>,
+    consumers: RwLock<BTreeMap<ConsumerId, Arc<ChannelRuntime>>>,
     next_server_name: AtomicU64,
     queue_channel_capacity: usize,
+    #[cfg(feature = "test-hooks")]
+    ack_pause: Option<Arc<AckPauseHook>>,
 }
 
 impl fmt::Debug for Vhost {
@@ -272,17 +307,12 @@ impl Vhost {
         config: VhostConfig,
     ) -> Self {
         let queue_channel_capacity = config.queue_channel_capacity();
-        let dispatcher = Arc::new(Mutex::new(ConsumerDispatcher::new()));
         let slots: BTreeMap<QueueName, Arc<QueueSlot>> = queues
             .iter()
             .map(|(name, queue)| {
                 (
                     name.clone(),
-                    Arc::new(QueueSlot::new(
-                        queue.clone(),
-                        Arc::clone(&dispatcher),
-                        queue_channel_capacity,
-                    )),
+                    Arc::new(QueueSlot::new(queue.clone(), queue_channel_capacity)),
                 )
             })
             .collect();
@@ -297,11 +327,21 @@ impl Vhost {
             id,
             name,
             router: RwLock::new(router),
-            queues: Mutex::new(slots),
-            dispatcher,
+            queues: RwLock::new(slots),
+            channels: RwLock::new(BTreeMap::new()),
+            consumers: RwLock::new(BTreeMap::new()),
             next_server_name: AtomicU64::new(0),
             queue_channel_capacity,
+            #[cfg(feature = "test-hooks")]
+            ack_pause: None,
         }
+    }
+
+    #[cfg(feature = "test-hooks")]
+    #[must_use]
+    pub fn with_ack_pause_hook(mut self, hook: Arc<AckPauseHook>) -> Self {
+        self.ack_pause = Some(hook);
+        self
     }
 
     pub fn id(&self) -> VhostId {
@@ -314,7 +354,7 @@ impl Vhost {
 
     fn slot(&self, name: &str) -> Result<Arc<QueueSlot>, DomainError> {
         self.queues
-            .lock()
+            .read()
             .map_err(|_| DomainError::BrokerClosed)?
             .get(name)
             .cloned()
@@ -325,7 +365,7 @@ impl Vhost {
     }
 
     fn maybe_slot(&self, name: &str) -> Option<Arc<QueueSlot>> {
-        self.queues.lock().ok()?.get(name).cloned()
+        self.queues.read().ok()?.get(name).cloned()
     }
 
     fn lock_queue<'a>(
@@ -333,6 +373,76 @@ impl Vhost {
         slot: &'a QueueSlot,
     ) -> Result<std::sync::MutexGuard<'a, Queue>, DomainError> {
         slot.queue.lock().map_err(|_| DomainError::BrokerClosed)
+    }
+
+    fn ensure_runtime(
+        &self,
+        channel: ChannelId,
+        connection: Option<ConnectionId>,
+    ) -> Result<Arc<ChannelRuntime>, DomainError> {
+        let mut channels = self
+            .channels
+            .write()
+            .map_err(|_| DomainError::BrokerClosed)?;
+        let runtime = channels
+            .entry(channel)
+            .or_insert_with(|| Arc::new(ChannelRuntime::new(connection)))
+            .clone();
+        if let Some(connection) = connection {
+            runtime.set_connection(connection);
+        }
+        Ok(runtime)
+    }
+
+    fn remove_slot_if_current(
+        &self,
+        name: &str,
+        slot: &Arc<QueueSlot>,
+    ) -> Result<bool, DomainError> {
+        let mut queues = self.queues.write().map_err(|_| DomainError::BrokerClosed)?;
+        if queues
+            .get(name)
+            .is_some_and(|current| Arc::ptr_eq(current, slot))
+        {
+            queues.remove(name);
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    fn discard_slot_state(&self, slot: &QueueSlot) -> Result<(), DomainError> {
+        let forgotten = {
+            let mut consumers = slot
+                .consumers
+                .lock()
+                .map_err(|_| DomainError::BrokerClosed)?;
+            for unacked in std::mem::take(&mut consumers.unacked).into_values() {
+                for (tag, entry) in unacked {
+                    if let Some(claimed) = entry.runtime.claim_tag_if_present(tag) {
+                        entry.runtime.release(claimed.credit.as_deref());
+                    }
+                }
+            }
+            let forgotten: Vec<(ConsumerId, Arc<ChannelRuntime>)> = consumers
+                .consumers
+                .iter()
+                .map(|consumer| (consumer.consumer, Arc::clone(&consumer.runtime)))
+                .collect();
+            consumers.consumers.clear();
+            consumers.cursor = None;
+            forgotten
+        };
+
+        if let Ok(mut directory) = self.consumers.write() {
+            for (consumer, _) in &forgotten {
+                directory.remove(consumer);
+            }
+        }
+        for (consumer, runtime) in forgotten {
+            runtime.remove_consumer(consumer);
+        }
+        Ok(())
     }
 
     /// Publishes a message using this virtual host's routing state.
@@ -348,7 +458,7 @@ impl Vhost {
         }
 
         let slots: Vec<Arc<QueueSlot>> = {
-            let queues = self.queues.lock().map_err(|_| DomainError::BrokerClosed)?;
+            let queues = self.queues.read().map_err(|_| DomainError::BrokerClosed)?;
             destinations
                 .iter()
                 .filter_map(|name| queues.get(name.as_str()).cloned())
@@ -387,6 +497,9 @@ impl Vhost {
     }
 
     /// Registers a consumer on a queue.
+    ///
+    /// Deliveries for this consumer use the generic [`DeliverySink`] supplied
+    /// to the queue task at dispatch time.
     pub async fn consume(
         &self,
         connection: ConnectionId,
@@ -395,43 +508,137 @@ impl Vhost {
         queue: impl AsRef<str>,
         options: ConsumerOptions,
     ) -> Result<(), DomainError> {
+        self.consume_inner(connection, channel, consumer, queue, options, None)
+            .await
+    }
+
+    /// Registers a consumer and captures its outbox at consume time.
+    ///
+    /// The queue task writes deliveries directly to this sender, so the
+    /// delivery hot path does not need to consult a route table.
+    pub async fn consume_with_outbox(
+        &self,
+        connection: ConnectionId,
+        channel: ChannelId,
+        consumer: ConsumerId,
+        queue: impl AsRef<str>,
+        options: ConsumerOptions,
+        outbox: OutboxSender,
+    ) -> Result<(), DomainError> {
+        self.consume_inner(connection, channel, consumer, queue, options, Some(outbox))
+            .await
+    }
+
+    async fn consume_inner(
+        &self,
+        connection: ConnectionId,
+        channel: ChannelId,
+        consumer: ConsumerId,
+        queue: impl AsRef<str>,
+        options: ConsumerOptions,
+        outbox: Option<OutboxSender>,
+    ) -> Result<(), DomainError> {
         let slot = self.slot(queue.as_ref())?;
-        let mut dispatcher = self
-            .dispatcher
-            .lock()
-            .map_err(|_| DomainError::BrokerClosed)?;
-        if dispatcher.contains_consumer(consumer) {
-            return Err(DomainError::InvalidArgument {
-                message: format!("consumer {} is already registered", consumer.get()),
-            });
+        if self
+            .consumers
+            .read()
+            .map_err(|_| DomainError::BrokerClosed)?
+            .contains_key(&consumer)
+        {
+            return Err(duplicate_consumer(consumer));
         }
 
         let queue_name = {
-            let mut queue = self.lock_queue(&slot)?;
+            let queue = self.lock_queue(&slot)?;
             queue.check_access(connection)?;
-            queue.add_consumer(connection, consumer);
             queue.name().clone()
         };
 
-        dispatcher.register_detached(connection, channel, consumer, queue_name, options)
+        let runtime = self.ensure_runtime(channel, Some(connection))?;
+        let credit = Arc::new(ConsumerCredit::new(consumer, queue_name));
+
+        {
+            let mut queue = self.lock_queue(&slot)?;
+            queue.check_access(connection)?;
+            queue.add_consumer(connection, consumer);
+        }
+
+        {
+            let mut consumers = slot
+                .consumers
+                .lock()
+                .map_err(|_| DomainError::BrokerClosed)?;
+            if consumers
+                .consumers
+                .iter()
+                .any(|candidate| candidate.consumer == consumer)
+                || !runtime.register_consumer(Arc::clone(&credit))
+            {
+                drop(consumers);
+                if let Ok(mut queue) = self.lock_queue(&slot) {
+                    queue.remove_consumer(consumer);
+                }
+                return Err(duplicate_consumer(consumer));
+            }
+            consumers.consumers.push(QueueConsumer {
+                consumer,
+                channel,
+                no_ack: options.no_ack,
+                credit,
+                runtime: Arc::clone(&runtime),
+                outbox,
+            });
+        }
+
+        let mut directory = self
+            .consumers
+            .write()
+            .map_err(|_| DomainError::BrokerClosed)?;
+        if directory.contains_key(&consumer) {
+            drop(directory);
+            let _ = slot
+                .consumers
+                .lock()
+                .map(|mut consumers| consumers.remove_consumer(consumer));
+            runtime.remove_consumer(consumer);
+            if let Ok(mut queue) = self.lock_queue(&slot) {
+                queue.remove_consumer(consumer);
+            }
+            return Err(duplicate_consumer(consumer));
+        }
+        directory.insert(consumer, runtime);
+        Ok(())
     }
 
     /// Cancels a consumer, returning whether it was registered.
     pub async fn cancel(&self, consumer: ConsumerId) -> Result<bool, DomainError> {
-        let queue_name = {
-            let mut dispatcher = self
-                .dispatcher
-                .lock()
-                .map_err(|_| DomainError::BrokerClosed)?;
-            dispatcher.detach_consumer(consumer)
-        };
-        let Some(queue_name) = queue_name else {
+        let runtime = self
+            .consumers
+            .read()
+            .map_err(|_| DomainError::BrokerClosed)?
+            .get(&consumer)
+            .cloned();
+        let Some(runtime) = runtime else {
             return Ok(false);
         };
-        if let Some(slot) = self.maybe_slot(queue_name.as_str()) {
-            let mut queue = self.lock_queue(&slot)?;
-            queue.remove_consumer(consumer);
+        let Some(credit) = runtime.remove_consumer(consumer) else {
+            return Ok(false);
+        };
+        if let Ok(mut directory) = self.consumers.write() {
+            directory.remove(&consumer);
         }
+
+        let Some(slot) = self.maybe_slot(credit.queue.as_str()) else {
+            return Ok(true);
+        };
+        {
+            let mut consumers = slot
+                .consumers
+                .lock()
+                .map_err(|_| DomainError::BrokerClosed)?;
+            consumers.remove_consumer(consumer);
+        }
+        self.remove_consumer_from_slot(&slot, consumer)?;
         Ok(true)
     }
 
@@ -442,11 +649,28 @@ impl Vhost {
         prefetch_count: u32,
         global: bool,
     ) -> Result<Vec<CreditSignal>, DomainError> {
-        let mut dispatcher = self
-            .dispatcher
-            .lock()
-            .map_err(|_| DomainError::BrokerClosed)?;
-        Ok(dispatcher.set_prefetch(channel, prefetch_count, global))
+        let runtime = self.ensure_runtime(channel, None)?;
+        if global {
+            runtime
+                .channel_prefetch
+                .store(prefetch_count, Ordering::Release);
+            return Ok(vec![CreditSignal::Channel {
+                channel,
+                credit: runtime.channel_credit(),
+            }]);
+        }
+
+        runtime
+            .consumer_prefetch
+            .store(prefetch_count, Ordering::Release);
+        Ok(runtime
+            .consumer_credits()
+            .into_iter()
+            .map(|credit| CreditSignal::Consumer {
+                consumer: credit.consumer,
+                credit: runtime.consumer_credit(credit.inflight()),
+            })
+            .collect())
     }
 
     /// Fetches one message for `basic.get`.
@@ -458,12 +682,56 @@ impl Vhost {
         no_ack: bool,
     ) -> Result<GetOutcome, DomainError> {
         let slot = self.slot(queue.as_ref())?;
-        let mut dispatcher = self
-            .dispatcher
-            .lock()
-            .map_err(|_| DomainError::BrokerClosed)?;
+        let runtime = self.ensure_runtime(channel, Some(connection))?;
         let mut queue = self.lock_queue(&slot)?;
-        dispatcher.get_detached(connection, channel, &mut queue, no_ack)
+        queue.check_access(connection)?;
+        let Some((message, redelivered)) = queue.take_front() else {
+            return Ok(GetOutcome::Empty);
+        };
+
+        let remaining = queue.message_count();
+        let queue_name = queue.name().clone();
+        let ack_state = if no_ack {
+            AckState::NotRequired
+        } else {
+            AckState::Required
+        };
+        let delivery_tag = runtime.allocate_tag();
+        if !no_ack {
+            let mut consumers = slot
+                .consumers
+                .lock()
+                .map_err(|_| DomainError::BrokerClosed)?;
+            runtime.reserve_get_slot();
+            if !runtime.insert_unacked(
+                delivery_tag,
+                ChannelUnacked {
+                    queue: queue_name.clone(),
+                    credit: None,
+                },
+            ) {
+                runtime.release_channel_slot();
+                drop(consumers);
+                queue.push_front(message, redelivered);
+                return Err(DomainError::BrokerClosed);
+            }
+            consumers.unacked.entry(channel).or_default().insert(
+                delivery_tag,
+                QueueUnacked {
+                    queue: queue_name,
+                    message: message.clone(),
+                    runtime: Arc::clone(&runtime),
+                },
+            );
+        }
+
+        Ok(GetOutcome::Message(GetMessage {
+            message,
+            redelivered,
+            ack_state,
+            remaining,
+            delivery_tag: Some(delivery_tag),
+        }))
     }
 
     /// Acknowledges one delivery or every delivery up to the tag.
@@ -473,11 +741,13 @@ impl Vhost {
         delivery_tag: DeliveryTag,
         multiple: bool,
     ) -> Result<SettleOutcome, DomainError> {
-        let mut dispatcher = self
-            .dispatcher
-            .lock()
-            .map_err(|_| DomainError::BrokerClosed)?;
-        dispatcher.ack(channel, delivery_tag, multiple)
+        #[cfg(feature = "test-hooks")]
+        if let Some(hook) = &self.ack_pause {
+            hook.pause().await;
+        }
+
+        let (outcome, _) = self.settle(channel, delivery_tag, multiple, false)?;
+        Ok(outcome)
     }
 
     /// Rejects one delivery or every delivery up to the tag.
@@ -512,24 +782,142 @@ impl Vhost {
         multiple: bool,
         requeue: bool,
     ) -> Result<(SettleOutcome, Vec<(QueueName, Message)>), DomainError> {
-        let mut dispatcher = self
-            .dispatcher
-            .lock()
-            .map_err(|_| DomainError::BrokerClosed)?;
-        dispatcher.settle_detached(channel, delivery_tag, multiple, requeue)
+        let runtime = self
+            .channels
+            .read()
+            .map_err(|_| DomainError::BrokerClosed)?
+            .get(&channel)
+            .cloned()
+            .ok_or_else(|| unknown_delivery_tag(channel, delivery_tag))?;
+
+        let claimed = if multiple {
+            runtime.claim_range(delivery_tag)
+        } else {
+            runtime
+                .claim_tag(delivery_tag)
+                .map(|entry| vec![(delivery_tag, entry)])
+        };
+        let Some(claimed) = claimed else {
+            return Err(unknown_delivery_tag(channel, delivery_tag));
+        };
+
+        let settled = claimed.len();
+        let mut consumer_counts: BTreeMap<ConsumerId, u32> = BTreeMap::new();
+        let mut per_queue: BTreeMap<QueueName, Vec<DeliveryTag>> = BTreeMap::new();
+        for (tag, entry) in &claimed {
+            runtime.release(entry.credit.as_deref());
+            if let Some(credit) = &entry.credit {
+                *consumer_counts.entry(credit.consumer).or_default() += 1;
+            }
+            per_queue.entry(entry.queue.clone()).or_default().push(*tag);
+        }
+
+        let entries = self.take_channel_entries(channel, per_queue)?;
+        let credit = Self::credit_signals(channel, &runtime, settled, consumer_counts);
+        Ok((
+            SettleOutcome {
+                settled,
+                requeued: 0,
+                credit,
+            },
+            if requeue { entries } else { Vec::new() },
+        ))
+    }
+
+    fn credit_signals(
+        channel: ChannelId,
+        runtime: &ChannelRuntime,
+        settled: usize,
+        consumer_counts: BTreeMap<ConsumerId, u32>,
+    ) -> Vec<CreditSignal> {
+        if settled == 0 {
+            return Vec::new();
+        }
+        if runtime.channel_prefetch.load(Ordering::Acquire) != 0 {
+            vec![CreditSignal::Channel {
+                channel,
+                credit: settled as u32,
+            }]
+        } else {
+            consumer_counts
+                .into_iter()
+                .map(|(consumer, credit)| CreditSignal::Consumer { consumer, credit })
+                .collect()
+        }
+    }
+
+    fn take_channel_entries(
+        &self,
+        channel: ChannelId,
+        per_queue: BTreeMap<QueueName, Vec<DeliveryTag>>,
+    ) -> Result<Vec<(QueueName, Message)>, DomainError> {
+        let mut entries = Vec::new();
+        for (queue_name, tags) in per_queue {
+            let Some(slot) = self.maybe_slot(queue_name.as_str()) else {
+                continue;
+            };
+            let removed = {
+                let mut consumers = slot
+                    .consumers
+                    .lock()
+                    .map_err(|_| DomainError::BrokerClosed)?;
+                let mut removed = Vec::new();
+                if let Some(unacked) = consumers.unacked.get_mut(&channel) {
+                    for tag in &tags {
+                        if let Some(entry) = unacked.remove(tag) {
+                            removed.push(entry);
+                        }
+                    }
+                    if unacked.is_empty() {
+                        consumers.unacked.remove(&channel);
+                    }
+                }
+                removed
+            };
+            entries.extend(
+                removed
+                    .into_iter()
+                    .map(|entry| (entry.queue, entry.message)),
+            );
+        }
+        Ok(entries)
     }
 
     /// Requeues every unacknowledged delivery on a channel.
     pub async fn recover(&self, channel: ChannelId) -> Result<SettleOutcome, DomainError> {
-        let (mut outcome, entries) = {
-            let mut dispatcher = self
-                .dispatcher
-                .lock()
-                .map_err(|_| DomainError::BrokerClosed)?;
-            dispatcher.recover_detached(channel)
+        let runtime = self
+            .channels
+            .read()
+            .map_err(|_| DomainError::BrokerClosed)?
+            .get(&channel)
+            .cloned();
+        let Some(runtime) = runtime else {
+            return Ok(SettleOutcome::default());
         };
-        outcome.requeued = self.requeue_entries(entries);
-        Ok(outcome)
+        let claimed = runtime.claim_all();
+        if claimed.is_empty() {
+            return Ok(SettleOutcome::default());
+        }
+
+        let settled = claimed.len();
+        let mut consumer_counts: BTreeMap<ConsumerId, u32> = BTreeMap::new();
+        let mut per_queue: BTreeMap<QueueName, Vec<DeliveryTag>> = BTreeMap::new();
+        for (tag, entry) in &claimed {
+            runtime.release(entry.credit.as_deref());
+            if let Some(credit) = &entry.credit {
+                *consumer_counts.entry(credit.consumer).or_default() += 1;
+            }
+            per_queue.entry(entry.queue.clone()).or_default().push(*tag);
+        }
+
+        let entries = self.take_channel_entries(channel, per_queue)?;
+        let requeued = self.requeue_entries(entries);
+        let credit = Self::credit_signals(channel, &runtime, settled, consumer_counts);
+        Ok(SettleOutcome {
+            settled,
+            requeued,
+            credit,
+        })
     }
 
     /// Dispatches ready messages for one queue to the given sink.
@@ -539,7 +927,7 @@ impl Vhost {
     {
         let slot = self.slot(queue.as_ref())?;
         slot.ensure_task();
-        let future = dispatch_future(Arc::clone(&slot.queue), Arc::clone(&slot.dispatcher), sink);
+        let future = dispatch_future(Arc::clone(&slot.queue), Arc::clone(&slot.consumers), sink);
         let (reply, response) = oneshot::channel();
         slot.sender
             .send(QueueCommand::Deliver { future, reply })
@@ -553,18 +941,17 @@ impl Vhost {
     where
         S: DeliverySink + Send + Clone + 'static,
     {
-        let names: Vec<QueueName> = {
-            let queues = self.queues.lock().map_err(|_| DomainError::BrokerClosed)?;
-            queues.keys().cloned().collect()
+        let slots: Vec<Arc<QueueSlot>> = {
+            let queues = self.queues.read().map_err(|_| DomainError::BrokerClosed)?;
+            queues.values().cloned().collect()
         };
 
-        let mut pending = Vec::with_capacity(names.len());
-        for name in names {
-            let slot = self.slot(name.as_str())?;
+        let mut pending = Vec::with_capacity(slots.len());
+        for slot in slots {
             slot.ensure_task();
             let future = dispatch_future(
                 Arc::clone(&slot.queue),
-                Arc::clone(&slot.dispatcher),
+                Arc::clone(&slot.consumers),
                 sink.clone(),
             );
             let (reply, response) = oneshot::channel();
@@ -592,7 +979,7 @@ impl Vhost {
     {
         let slot = self.slot(queue.as_ref())?;
         slot.ensure_task();
-        let future = dispatch_future(Arc::clone(&slot.queue), Arc::clone(&slot.dispatcher), sink);
+        let future = dispatch_future(Arc::clone(&slot.queue), Arc::clone(&slot.consumers), sink);
         let command = QueueCommand::DeliverDetached { future };
         match slot.sender.try_send(command) {
             Ok(()) => {}
@@ -612,17 +999,16 @@ impl Vhost {
     where
         S: DeliverySink + Send + Clone + 'static,
     {
-        let names: Vec<QueueName> = {
-            let queues = self.queues.lock().map_err(|_| DomainError::BrokerClosed)?;
-            queues.keys().cloned().collect()
+        let slots: Vec<Arc<QueueSlot>> = {
+            let queues = self.queues.read().map_err(|_| DomainError::BrokerClosed)?;
+            queues.values().cloned().collect()
         };
 
-        for name in names {
-            let slot = self.slot(name.as_str())?;
+        for slot in slots {
             slot.ensure_task();
             let future = dispatch_future(
                 Arc::clone(&slot.queue),
-                Arc::clone(&slot.dispatcher),
+                Arc::clone(&slot.consumers),
                 sink.clone(),
             );
             let command = QueueCommand::DeliverDetached { future };
@@ -643,36 +1029,106 @@ impl Vhost {
     /// Requeues unacknowledged deliveries on a closing channel and removes its
     /// consumers.
     pub async fn close_channel(&self, channel: ChannelId) -> Result<SettleOutcome, DomainError> {
-        let (mut outcome, entries, consumers) = {
-            let mut dispatcher = self
-                .dispatcher
-                .lock()
+        let runtime = {
+            let mut channels = self
+                .channels
+                .write()
                 .map_err(|_| DomainError::BrokerClosed)?;
-            dispatcher.close_channel_detached(channel)
+            channels.remove(&channel)
         };
+        let Some(runtime) = runtime else {
+            return Ok(SettleOutcome::default());
+        };
+        runtime.close();
 
-        for (consumer, queue) in consumers {
-            self.remove_consumer_from_queue(queue.as_str(), consumer)?;
+        let claimed = runtime.claim_all();
+        let consumers = runtime.take_consumers();
+        if let Ok(mut directory) = self.consumers.write() {
+            for credit in &consumers {
+                directory.remove(&credit.consumer);
+            }
         }
-        outcome.requeued = self.requeue_entries(entries);
-        Ok(outcome)
+
+        let settled = claimed.len();
+        let mut per_queue: BTreeMap<QueueName, Vec<DeliveryTag>> = BTreeMap::new();
+        for (tag, entry) in claimed {
+            runtime.release(entry.credit.as_deref());
+            per_queue.entry(entry.queue).or_default().push(tag);
+        }
+        let entries = self.take_channel_entries(channel, per_queue)?;
+
+        for credit in &consumers {
+            if let Some(slot) = self.maybe_slot(credit.queue.as_str()) {
+                {
+                    let mut state = slot
+                        .consumers
+                        .lock()
+                        .map_err(|_| DomainError::BrokerClosed)?;
+                    state.remove_consumer(credit.consumer);
+                }
+                self.remove_consumer_from_slot(&slot, credit.consumer)?;
+            }
+        }
+
+        let requeued = self.requeue_entries(entries);
+        Ok(SettleOutcome {
+            settled,
+            requeued,
+            credit: Vec::new(),
+        })
     }
 
     /// Requeues unacknowledged deliveries for a closed connection and removes
     /// its consumers.
     pub async fn close_connection(&self, connection: ConnectionId) -> ConnectionCloseOutcome {
-        let (entries, _consumers) = {
-            let Ok(mut dispatcher) = self.dispatcher.lock() else {
+        let runtimes: Vec<(ChannelId, Arc<ChannelRuntime>)> = {
+            let Ok(mut channels) = self.channels.write() else {
                 return ConnectionCloseOutcome::default();
             };
-            dispatcher.close_connection_detached(connection)
+            let matching: Vec<ChannelId> = channels
+                .iter()
+                .filter(|(_, runtime)| runtime.connection() == Some(connection))
+                .map(|(channel, _)| *channel)
+                .collect();
+            matching
+                .into_iter()
+                .filter_map(|channel| channels.remove(&channel).map(|runtime| (channel, runtime)))
+                .collect()
         };
 
-        self.requeue_entries(entries);
+        let mut requeued_entries = Vec::new();
+        for (channel, runtime) in runtimes {
+            runtime.close();
+            let claimed = runtime.claim_all();
+            let consumers = runtime.take_consumers();
+            if let Ok(mut directory) = self.consumers.write() {
+                for credit in &consumers {
+                    directory.remove(&credit.consumer);
+                }
+            }
+
+            let mut per_queue: BTreeMap<QueueName, Vec<DeliveryTag>> = BTreeMap::new();
+            for (tag, entry) in claimed {
+                runtime.release(entry.credit.as_deref());
+                per_queue.entry(entry.queue).or_default().push(tag);
+            }
+            if let Ok(entries) = self.take_channel_entries(channel, per_queue) {
+                requeued_entries.extend(entries);
+            }
+
+            for credit in &consumers {
+                if let Some(slot) = self.maybe_slot(credit.queue.as_str()) {
+                    if let Ok(mut state) = slot.consumers.lock() {
+                        state.remove_consumer(credit.consumer);
+                    }
+                }
+            }
+        }
+        self.requeue_entries(requeued_entries);
 
         let names: Vec<QueueName> = self
             .queues
-            .lock()
+            .read()
             .map(|queues| queues.keys().cloned().collect())
             .unwrap_or_default();
         let mut outcome = ConnectionCloseOutcome::default();
@@ -702,10 +1158,12 @@ impl Vhost {
                 }
             }
 
-            if remove {
-                if let Ok(mut queues) = self.queues.lock() {
-                    queues.remove(name.as_str());
-                }
+            if remove
+                && self
+                    .remove_slot_if_current(name.as_str(), &slot)
+                    .unwrap_or(false)
+            {
+                let _ = self.discard_slot_state(&slot);
                 outcome.deleted_queues.push(name);
                 outcome.cancels.extend(cancels);
             }
@@ -848,55 +1306,49 @@ impl Vhost {
 
         let (slot, queue_name) = if name.is_empty() {
             validate_queue_arguments(&config.arguments)?;
-            let mut queues = self.queues.lock().map_err(|_| DomainError::BrokerClosed)?;
-            let queue_name = self.generate_server_name(&queues);
-            let queue = Queue::new(queue_name.clone(), config, connection);
-            let slot = Arc::new(QueueSlot::new(
-                queue,
-                Arc::clone(&self.dispatcher),
-                self.queue_channel_capacity,
-            ));
-            queues.insert(queue_name.clone(), Arc::clone(&slot));
-            drop(queues);
+            let (slot, queue_name) = {
+                let mut queues = self.queues.write().map_err(|_| DomainError::BrokerClosed)?;
+                let queue_name = self.generate_server_name(&queues);
+                let queue = Queue::new(queue_name.clone(), config, connection);
+                let slot = Arc::new(QueueSlot::new(queue, self.queue_channel_capacity));
+                queues.insert(queue_name.clone(), Arc::clone(&slot));
+                (slot, queue_name)
+            };
             slot.ensure_task();
             (slot, queue_name)
         } else {
             let queue_name = QueueName::new(name)?;
-            let existing = self
-                .queues
-                .lock()
-                .map_err(|_| DomainError::BrokerClosed)?
-                .get(name)
-                .cloned();
+            let existing = {
+                let queues = self.queues.read().map_err(|_| DomainError::BrokerClosed)?;
+                queues.get(name).cloned()
+            };
             match existing {
                 Some(slot) => {
-                    let queue = self.lock_queue(&slot)?;
-                    queue.check_access(connection)?;
-                    validate_queue_arguments(&config.arguments)?;
-                    if queue.config() != &config {
-                        return Err(DomainError::PreconditionFailed {
-                            message: format!(
-                                "queue '{}' already exists with different properties",
-                                queue_name.as_str()
-                            ),
-                        });
-                    }
-                    drop(queue);
+                    self.validate_redeclared_queue(&slot, &queue_name, &config, connection)?;
                     (slot, queue_name)
                 }
                 None => {
-                    validate_queue_arguments(&config.arguments)?;
-                    let queue = Queue::new(queue_name.clone(), config, connection);
-                    let slot = Arc::new(QueueSlot::new(
-                        queue,
-                        Arc::clone(&self.dispatcher),
-                        self.queue_channel_capacity,
-                    ));
-                    self.queues
-                        .lock()
-                        .map_err(|_| DomainError::BrokerClosed)?
-                        .insert(queue_name.clone(), Arc::clone(&slot));
-                    slot.ensure_task();
+                    let (slot, inserted) = {
+                        let mut queues =
+                            self.queues.write().map_err(|_| DomainError::BrokerClosed)?;
+                        match queues.get(name).cloned() {
+                            Some(winner) => (winner, false),
+                            None => {
+                                validate_queue_arguments(&config.arguments)?;
+                                let queue =
+                                    Queue::new(queue_name.clone(), config.clone(), connection);
+                                let slot =
+                                    Arc::new(QueueSlot::new(queue, self.queue_channel_capacity));
+                                queues.insert(queue_name.clone(), Arc::clone(&slot));
+                                (slot, true)
+                            }
+                        }
+                    };
+                    if inserted {
+                        slot.ensure_task();
+                    } else {
+                        self.validate_redeclared_queue(&slot, &queue_name, &config, connection)?;
+                    }
                     (slot, queue_name)
                 }
             }
@@ -978,39 +1430,38 @@ impl Vhost {
             (messages, cancels)
         };
 
-        self.queues
-            .lock()
-            .map_err(|_| DomainError::BrokerClosed)?
-            .remove(name);
+        let removed = self.remove_slot_if_current(name, &slot)?;
+        let _ = self.discard_slot_state(&slot);
 
-        if let Ok(mut dispatcher) = self.dispatcher.lock() {
-            let consumers: Vec<ConsumerId> = cancels.iter().map(|cancel| cancel.consumer).collect();
-            dispatcher.forget_consumers(&consumers);
+        if removed {
+            Ok(QueueDeleteOutcome { messages, cancels })
+        } else {
+            Ok(QueueDeleteOutcome::default())
         }
-
-        Ok(QueueDeleteOutcome { messages, cancels })
     }
 
-    fn remove_consumer_from_queue(
+    fn remove_consumer_from_slot(
         &self,
-        queue_name: &str,
+        slot: &Arc<QueueSlot>,
         consumer: ConsumerId,
     ) -> Result<bool, DomainError> {
-        let Some(slot) = self.maybe_slot(queue_name) else {
-            return Ok(false);
-        };
-        let auto_delete = {
-            let mut queue = self.lock_queue(&slot)?;
+        let (auto_delete, name) = {
+            let mut queue = self.lock_queue(slot)?;
             let removed = queue.remove_consumer(consumer);
-            queue.is_auto_delete() && removed && queue.consumer_count() == 0
+            let name = queue.name().clone();
+            (
+                queue.is_auto_delete() && removed && queue.consumer_count() == 0,
+                name,
+            )
         };
         if auto_delete {
-            self.queues
-                .lock()
-                .map_err(|_| DomainError::BrokerClosed)?
-                .remove(queue_name);
+            let removed = self.remove_slot_if_current(name.as_str(), slot)?;
+            if removed {
+                self.discard_slot_state(slot)?;
+            }
+            return Ok(removed);
         }
-        Ok(auto_delete)
+        Ok(false)
     }
 
     fn requeue_entries(&self, entries: Vec<(QueueName, Message)>) -> usize {
@@ -1033,6 +1484,27 @@ impl Vhost {
             }
         }
         requeued
+    }
+
+    fn validate_redeclared_queue(
+        &self,
+        slot: &Arc<QueueSlot>,
+        queue_name: &QueueName,
+        config: &QueueConfig,
+        connection: ConnectionId,
+    ) -> Result<(), DomainError> {
+        let queue = self.lock_queue(slot)?;
+        queue.check_access(connection)?;
+        validate_queue_arguments(&config.arguments)?;
+        if queue.config() != config {
+            return Err(DomainError::PreconditionFailed {
+                message: format!(
+                    "queue '{}' already exists with different properties",
+                    queue_name.as_str()
+                ),
+            });
+        }
+        Ok(())
     }
 
     fn generate_server_name(&self, queues: &BTreeMap<QueueName, Arc<QueueSlot>>) -> QueueName {
@@ -1060,6 +1532,22 @@ pub struct QueueDeclaration {
 
 fn count_to_u32(count: usize) -> u32 {
     u32::try_from(count).unwrap_or(u32::MAX)
+}
+
+fn duplicate_consumer(consumer: ConsumerId) -> DomainError {
+    DomainError::InvalidArgument {
+        message: format!("consumer {} is already registered", consumer.get()),
+    }
+}
+
+fn unknown_delivery_tag(channel: ChannelId, delivery_tag: DeliveryTag) -> DomainError {
+    DomainError::PreconditionFailed {
+        message: format!(
+            "unknown delivery tag {} on channel {}",
+            delivery_tag.get(),
+            channel.get()
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -1136,6 +1624,61 @@ mod tests {
             .await
             .expect_err("default exchange bind");
         assert!(matches!(error, DomainError::AccessRefused { .. }));
+    }
+
+    #[test]
+    fn publish_does_not_take_the_exclusive_queue_directory_lock() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let vhost = Arc::new(vhost());
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+
+        let reader = {
+            let vhost = Arc::clone(&vhost);
+            std::thread::spawn(move || {
+                let guard = vhost.queues.read().expect("queue directory read lock");
+                entered_tx.send(()).expect("signal reader entered");
+                let _ = release_rx.recv();
+                drop(guard);
+            })
+        };
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("reader acquired the shared queue directory lock");
+
+        let (result_tx, result_rx) = mpsc::channel();
+        let publisher = {
+            let vhost = Arc::clone(&vhost);
+            std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .expect("current-thread runtime");
+                let outcome = runtime.block_on(vhost.publish(
+                    ConnectionId::new(1),
+                    PublishRequest {
+                        exchange: "",
+                        routing_key: "unknown-queue",
+                        mandatory: false,
+                        message: crate::message::Message::new(bytes::Bytes::from_static(b"x")),
+                        properties: (),
+                    },
+                ));
+                let _ = result_tx.send(outcome);
+            })
+        };
+
+        let outcome = result_rx.recv_timeout(Duration::from_secs(5));
+
+        let _ = release_tx.send(());
+        reader.join().expect("reader thread joins");
+        publisher.join().expect("publisher thread joins");
+
+        assert_eq!(
+            outcome.expect("publish completes while the shared lock is held"),
+            Ok(PublishOutcome::Dropped)
+        );
     }
 
     #[tokio::test]
