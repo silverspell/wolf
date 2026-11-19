@@ -24,6 +24,8 @@ use crate::queue::{
     ConnectionCloseOutcome, ConnectionId, Queue, QueueConfig, QueueDeleteOutcome, QueueRegistry,
 };
 use crate::router::Router;
+#[cfg(feature = "test-hooks")]
+use crate::test_hooks::AckPauseHook;
 use crate::validation::validate_queue_arguments;
 
 /// A validated virtual host name.
@@ -232,6 +234,8 @@ pub struct Vhost {
     dispatcher: Dispatcher,
     next_server_name: AtomicU64,
     queue_channel_capacity: usize,
+    #[cfg(feature = "test-hooks")]
+    ack_pause: Option<Arc<AckPauseHook>>,
 }
 
 impl fmt::Debug for Vhost {
@@ -301,7 +305,16 @@ impl Vhost {
             dispatcher,
             next_server_name: AtomicU64::new(0),
             queue_channel_capacity,
+            #[cfg(feature = "test-hooks")]
+            ack_pause: None,
         }
+    }
+
+    #[cfg(feature = "test-hooks")]
+    #[must_use]
+    pub fn with_ack_pause_hook(mut self, hook: Arc<AckPauseHook>) -> Self {
+        self.ack_pause = Some(hook);
+        self
     }
 
     pub fn id(&self) -> VhostId {
@@ -473,6 +486,11 @@ impl Vhost {
         delivery_tag: DeliveryTag,
         multiple: bool,
     ) -> Result<SettleOutcome, DomainError> {
+        #[cfg(feature = "test-hooks")]
+        if let Some(hook) = &self.ack_pause {
+            hook.pause().await;
+        }
+
         let mut dispatcher = self
             .dispatcher
             .lock()
