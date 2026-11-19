@@ -12,7 +12,8 @@ use tokio::task::JoinHandle;
 
 use crate::binding::QueueName;
 use crate::consumer::{
-    ChannelRuntime, ConsumerOptions, QueueConsumer, QueueConsumerState, QueueUnacked, SettleOutcome,
+    ChannelRuntime, ChannelUnacked, ConsumerCredit, ConsumerOptions, QueueConsumer,
+    QueueConsumerState, QueueUnacked, SettleOutcome,
 };
 use crate::delivery::{
     CancelReason, ChannelId, ConsumerCancel, ConsumerId, CreditSignal, DeliverOutcome, Delivery,
@@ -222,7 +223,12 @@ async fn deliver_ready<S: DeliverySink>(
                 .take_front()
                 .expect("a non-empty queue has a front message");
             let queue_name = queue.name().clone();
-            let delivery_tag = consumers.record_delivery(&consumer, queue_name, message.clone());
+            let Some(delivery_tag) =
+                consumers.record_delivery(&consumer, queue_name, message.clone())
+            else {
+                queue.push_front(message, redelivered);
+                break;
+            };
             Some(Delivery {
                 consumer: consumer.consumer,
                 delivery_tag,
@@ -248,6 +254,7 @@ pub struct Vhost {
     router: RwLock<Router>,
     queues: RwLock<BTreeMap<QueueName, Arc<QueueSlot>>>,
     channels: RwLock<BTreeMap<ChannelId, Arc<ChannelRuntime>>>,
+    consumers: RwLock<BTreeMap<ConsumerId, Arc<ChannelRuntime>>>,
     next_server_name: AtomicU64,
     queue_channel_capacity: usize,
     #[cfg(feature = "test-hooks")]
@@ -314,6 +321,7 @@ impl Vhost {
             router: RwLock::new(router),
             queues: RwLock::new(slots),
             channels: RwLock::new(BTreeMap::new()),
+            consumers: RwLock::new(BTreeMap::new()),
             next_server_name: AtomicU64::new(0),
             queue_channel_capacity,
             #[cfg(feature = "test-hooks")]
@@ -359,11 +367,6 @@ impl Vhost {
         slot.queue.lock().map_err(|_| DomainError::BrokerClosed)
     }
 
-    fn snapshot_slots(&self) -> Result<Vec<Arc<QueueSlot>>, DomainError> {
-        let queues = self.queues.read().map_err(|_| DomainError::BrokerClosed)?;
-        Ok(queues.values().cloned().collect())
-    }
-
     fn ensure_runtime(
         &self,
         channel: ChannelId,
@@ -381,23 +384,6 @@ impl Vhost {
             runtime.set_connection(connection);
         }
         Ok(runtime)
-    }
-
-    fn consumer_registered(&self, consumer: ConsumerId) -> Result<bool, DomainError> {
-        for slot in self.snapshot_slots()? {
-            let consumers = slot
-                .consumers
-                .lock()
-                .map_err(|_| DomainError::BrokerClosed)?;
-            if consumers
-                .consumers
-                .iter()
-                .any(|candidate| candidate.consumer == consumer)
-            {
-                return Ok(true);
-            }
-        }
-        Ok(false)
     }
 
     fn remove_slot_if_current(
@@ -418,17 +404,36 @@ impl Vhost {
     }
 
     fn discard_slot_state(&self, slot: &QueueSlot) -> Result<(), DomainError> {
-        let mut consumers = slot
-            .consumers
-            .lock()
-            .map_err(|_| DomainError::BrokerClosed)?;
-        for unacked in std::mem::take(&mut consumers.unacked).into_values() {
-            for entry in unacked.into_values() {
-                entry.runtime.release_channel_slot();
+        let forgotten = {
+            let mut consumers = slot
+                .consumers
+                .lock()
+                .map_err(|_| DomainError::BrokerClosed)?;
+            for unacked in std::mem::take(&mut consumers.unacked).into_values() {
+                for (tag, entry) in unacked {
+                    if let Some(claimed) = entry.runtime.claim_tag_if_present(tag) {
+                        entry.runtime.release(claimed.credit.as_deref());
+                    }
+                }
+            }
+            let forgotten: Vec<(ConsumerId, Arc<ChannelRuntime>)> = consumers
+                .consumers
+                .iter()
+                .map(|consumer| (consumer.consumer, Arc::clone(&consumer.runtime)))
+                .collect();
+            consumers.consumers.clear();
+            consumers.cursor = None;
+            forgotten
+        };
+
+        if let Ok(mut directory) = self.consumers.write() {
+            for (consumer, _) in &forgotten {
+                directory.remove(consumer);
             }
         }
-        consumers.consumers.clear();
-        consumers.cursor = None;
+        for (consumer, runtime) in forgotten {
+            runtime.remove_consumer(consumer);
+        }
         Ok(())
     }
 
@@ -493,11 +498,23 @@ impl Vhost {
         options: ConsumerOptions,
     ) -> Result<(), DomainError> {
         let slot = self.slot(queue.as_ref())?;
-        if self.consumer_registered(consumer)? {
-            return Err(DomainError::InvalidArgument {
-                message: format!("consumer {} is already registered", consumer.get()),
-            });
+        if self
+            .consumers
+            .read()
+            .map_err(|_| DomainError::BrokerClosed)?
+            .contains_key(&consumer)
+        {
+            return Err(duplicate_consumer(consumer));
         }
+
+        let queue_name = {
+            let queue = self.lock_queue(&slot)?;
+            queue.check_access(connection)?;
+            queue.name().clone()
+        };
+
+        let runtime = self.ensure_runtime(channel, Some(connection))?;
+        let credit = Arc::new(ConsumerCredit::new(consumer, queue_name));
 
         {
             let mut queue = self.lock_queue(&slot)?;
@@ -505,47 +522,82 @@ impl Vhost {
             queue.add_consumer(connection, consumer);
         }
 
-        let runtime = self.ensure_runtime(channel, Some(connection))?;
-        let mut consumers = slot
-            .consumers
-            .lock()
-            .map_err(|_| DomainError::BrokerClosed)?;
-        if consumers
-            .consumers
-            .iter()
-            .any(|candidate| candidate.consumer == consumer)
         {
-            return Err(DomainError::InvalidArgument {
-                message: format!("consumer {} is already registered", consumer.get()),
+            let mut consumers = slot
+                .consumers
+                .lock()
+                .map_err(|_| DomainError::BrokerClosed)?;
+            if consumers
+                .consumers
+                .iter()
+                .any(|candidate| candidate.consumer == consumer)
+                || !runtime.register_consumer(Arc::clone(&credit))
+            {
+                drop(consumers);
+                if let Ok(mut queue) = self.lock_queue(&slot) {
+                    queue.remove_consumer(consumer);
+                }
+                return Err(duplicate_consumer(consumer));
+            }
+            consumers.consumers.push(QueueConsumer {
+                consumer,
+                channel,
+                no_ack: options.no_ack,
+                credit,
+                runtime: Arc::clone(&runtime),
             });
         }
-        consumers.consumers.push(QueueConsumer {
-            consumer,
-            connection,
-            channel,
-            no_ack: options.no_ack,
-            inflight: 0,
-            runtime,
-        });
+
+        let mut directory = self
+            .consumers
+            .write()
+            .map_err(|_| DomainError::BrokerClosed)?;
+        if directory.contains_key(&consumer) {
+            drop(directory);
+            let _ = slot
+                .consumers
+                .lock()
+                .map(|mut consumers| consumers.remove_consumer(consumer));
+            runtime.remove_consumer(consumer);
+            if let Ok(mut queue) = self.lock_queue(&slot) {
+                queue.remove_consumer(consumer);
+            }
+            return Err(duplicate_consumer(consumer));
+        }
+        directory.insert(consumer, runtime);
         Ok(())
     }
 
     /// Cancels a consumer, returning whether it was registered.
     pub async fn cancel(&self, consumer: ConsumerId) -> Result<bool, DomainError> {
-        for slot in self.snapshot_slots()? {
-            let removed = {
-                let mut consumers = slot
-                    .consumers
-                    .lock()
-                    .map_err(|_| DomainError::BrokerClosed)?;
-                consumers.remove_consumer(consumer)
-            };
-            if removed.is_some() {
-                self.remove_consumer_from_slot(&slot, consumer)?;
-                return Ok(true);
-            }
+        let runtime = self
+            .consumers
+            .read()
+            .map_err(|_| DomainError::BrokerClosed)?
+            .get(&consumer)
+            .cloned();
+        let Some(runtime) = runtime else {
+            return Ok(false);
+        };
+        let Some(credit) = runtime.remove_consumer(consumer) else {
+            return Ok(false);
+        };
+        if let Ok(mut directory) = self.consumers.write() {
+            directory.remove(&consumer);
         }
-        Ok(false)
+
+        let Some(slot) = self.maybe_slot(credit.queue.as_str()) else {
+            return Ok(true);
+        };
+        {
+            let mut consumers = slot
+                .consumers
+                .lock()
+                .map_err(|_| DomainError::BrokerClosed)?;
+            consumers.remove_consumer(consumer);
+        }
+        self.remove_consumer_from_slot(&slot, consumer)?;
+        Ok(true)
     }
 
     /// Applies a prefetch limit to a channel and returns credit signals.
@@ -569,23 +621,12 @@ impl Vhost {
         runtime
             .consumer_prefetch
             .store(prefetch_count, Ordering::Release);
-        let mut inflight = BTreeMap::new();
-        for slot in self.snapshot_slots()? {
-            let consumers = slot
-                .consumers
-                .lock()
-                .map_err(|_| DomainError::BrokerClosed)?;
-            for consumer in &consumers.consumers {
-                if consumer.channel == channel {
-                    inflight.insert(consumer.consumer, consumer.inflight);
-                }
-            }
-        }
-        Ok(inflight
+        Ok(runtime
+            .consumer_credits()
             .into_iter()
-            .map(|(consumer, inflight)| CreditSignal::Consumer {
-                consumer,
-                credit: runtime.consumer_credit(inflight),
+            .map(|credit| CreditSignal::Consumer {
+                consumer: credit.consumer,
+                credit: runtime.consumer_credit(credit.inflight()),
             })
             .collect())
     }
@@ -607,6 +648,7 @@ impl Vhost {
         };
 
         let remaining = queue.message_count();
+        let queue_name = queue.name().clone();
         let ack_state = if no_ack {
             AckState::NotRequired
         } else {
@@ -614,16 +656,27 @@ impl Vhost {
         };
         let delivery_tag = runtime.allocate_tag();
         if !no_ack {
-            runtime.inflight.fetch_add(1, Ordering::AcqRel);
             let mut consumers = slot
                 .consumers
                 .lock()
                 .map_err(|_| DomainError::BrokerClosed)?;
+            runtime.reserve_get_slot();
+            if !runtime.insert_unacked(
+                delivery_tag,
+                ChannelUnacked {
+                    queue: queue_name.clone(),
+                    credit: None,
+                },
+            ) {
+                runtime.release_channel_slot();
+                drop(consumers);
+                queue.push_front(message, redelivered);
+                return Err(DomainError::BrokerClosed);
+            }
             consumers.unacked.entry(channel).or_default().insert(
                 delivery_tag,
                 QueueUnacked {
-                    consumer: None,
-                    queue: queue.name().clone(),
+                    queue: queue_name,
                     message: message.clone(),
                     runtime: Arc::clone(&runtime),
                 },
@@ -687,49 +740,80 @@ impl Vhost {
         multiple: bool,
         requeue: bool,
     ) -> Result<(SettleOutcome, Vec<(QueueName, Message)>), DomainError> {
-        let mut plan = Vec::new();
-        let mut found = false;
-        for slot in self.snapshot_slots()? {
-            let consumers = slot
-                .consumers
-                .lock()
-                .map_err(|_| DomainError::BrokerClosed)?;
-            let Some(unacked) = consumers.unacked.get(&channel) else {
-                continue;
-            };
-            if unacked.contains_key(&delivery_tag) {
-                found = true;
-            }
-            if multiple {
-                let tags: Vec<DeliveryTag> = unacked
-                    .range(..=delivery_tag)
-                    .map(|(tag, _)| *tag)
-                    .collect();
-                if !tags.is_empty() {
-                    plan.push((Arc::clone(&slot), tags));
-                }
-            } else if unacked.contains_key(&delivery_tag) {
-                plan.push((Arc::clone(&slot), vec![delivery_tag]));
-            }
-        }
-        if !found {
+        let runtime = self
+            .channels
+            .read()
+            .map_err(|_| DomainError::BrokerClosed)?
+            .get(&channel)
+            .cloned()
+            .ok_or_else(|| unknown_delivery_tag(channel, delivery_tag))?;
+
+        let claimed = if multiple {
+            runtime.claim_range(delivery_tag)
+        } else {
+            runtime
+                .claim_tag(delivery_tag)
+                .map(|entry| vec![(delivery_tag, entry)])
+        };
+        let Some(claimed) = claimed else {
             return Err(unknown_delivery_tag(channel, delivery_tag));
+        };
+
+        let settled = claimed.len();
+        let mut consumer_counts: BTreeMap<ConsumerId, u32> = BTreeMap::new();
+        let mut per_queue: BTreeMap<QueueName, Vec<DeliveryTag>> = BTreeMap::new();
+        for (tag, entry) in &claimed {
+            runtime.release(entry.credit.as_deref());
+            if let Some(credit) = &entry.credit {
+                *consumer_counts.entry(credit.consumer).or_default() += 1;
+            }
+            per_queue.entry(entry.queue.clone()).or_default().push(*tag);
         }
-        self.apply_plan(channel, plan, requeue)
+
+        let entries = self.take_channel_entries(channel, per_queue)?;
+        let credit = Self::credit_signals(channel, &runtime, settled, consumer_counts);
+        Ok((
+            SettleOutcome {
+                settled,
+                requeued: 0,
+                credit,
+            },
+            if requeue { entries } else { Vec::new() },
+        ))
     }
 
-    fn apply_plan(
+    fn credit_signals(
+        channel: ChannelId,
+        runtime: &ChannelRuntime,
+        settled: usize,
+        consumer_counts: BTreeMap<ConsumerId, u32>,
+    ) -> Vec<CreditSignal> {
+        if settled == 0 {
+            return Vec::new();
+        }
+        if runtime.channel_prefetch.load(Ordering::Acquire) != 0 {
+            vec![CreditSignal::Channel {
+                channel,
+                credit: settled as u32,
+            }]
+        } else {
+            consumer_counts
+                .into_iter()
+                .map(|(consumer, credit)| CreditSignal::Consumer { consumer, credit })
+                .collect()
+        }
+    }
+
+    fn take_channel_entries(
         &self,
         channel: ChannelId,
-        plan: Vec<(Arc<QueueSlot>, Vec<DeliveryTag>)>,
-        requeue: bool,
-    ) -> Result<(SettleOutcome, Vec<(QueueName, Message)>), DomainError> {
-        let mut settled = 0usize;
-        let mut consumer_counts: BTreeMap<ConsumerId, u32> = BTreeMap::new();
+        per_queue: BTreeMap<QueueName, Vec<DeliveryTag>>,
+    ) -> Result<Vec<(QueueName, Message)>, DomainError> {
         let mut entries = Vec::new();
-        let mut runtime: Option<Arc<ChannelRuntime>> = None;
-
-        for (slot, tags) in plan {
+        for (queue_name, tags) in per_queue {
+            let Some(slot) = self.maybe_slot(queue_name.as_str()) else {
+                continue;
+            };
             let removed = {
                 let mut consumers = slot
                     .consumers
@@ -746,79 +830,52 @@ impl Vhost {
                         consumers.unacked.remove(&channel);
                     }
                 }
-                for entry in &removed {
-                    if let Some(consumer) = entry.consumer {
-                        if let Some(record) = consumers
-                            .consumers
-                            .iter_mut()
-                            .find(|candidate| candidate.consumer == consumer)
-                        {
-                            record.inflight = record.inflight.saturating_sub(1);
-                        }
-                    }
-                }
                 removed
             };
-
-            for entry in removed {
-                entry.runtime.release_channel_slot();
-                settled += 1;
-                runtime = Some(Arc::clone(&entry.runtime));
-                if let Some(consumer) = entry.consumer {
-                    *consumer_counts.entry(consumer).or_default() += 1;
-                }
-                if requeue {
-                    entries.push((entry.queue, entry.message));
-                }
-            }
-        }
-
-        let credit = if settled == 0 {
-            Vec::new()
-        } else {
-            let runtime = runtime.expect("settled deliveries carry a channel runtime");
-            if runtime.channel_prefetch.load(Ordering::Acquire) != 0 {
-                vec![CreditSignal::Channel {
-                    channel,
-                    credit: settled as u32,
-                }]
-            } else {
-                consumer_counts
+            entries.extend(
+                removed
                     .into_iter()
-                    .map(|(consumer, credit)| CreditSignal::Consumer { consumer, credit })
-                    .collect()
-            }
-        };
-
-        Ok((
-            SettleOutcome {
-                settled,
-                requeued: 0,
-                credit,
-            },
-            entries,
-        ))
+                    .map(|entry| (entry.queue, entry.message)),
+            );
+        }
+        Ok(entries)
     }
 
     /// Requeues every unacknowledged delivery on a channel.
     pub async fn recover(&self, channel: ChannelId) -> Result<SettleOutcome, DomainError> {
-        let mut plan = Vec::new();
-        for slot in self.snapshot_slots()? {
-            let consumers = slot
-                .consumers
-                .lock()
-                .map_err(|_| DomainError::BrokerClosed)?;
-            if let Some(unacked) = consumers.unacked.get(&channel) {
-                let tags: Vec<DeliveryTag> = unacked.keys().copied().collect();
-                if !tags.is_empty() {
-                    plan.push((Arc::clone(&slot), tags));
-                }
-            }
+        let runtime = self
+            .channels
+            .read()
+            .map_err(|_| DomainError::BrokerClosed)?
+            .get(&channel)
+            .cloned();
+        let Some(runtime) = runtime else {
+            return Ok(SettleOutcome::default());
+        };
+        let claimed = runtime.claim_all();
+        if claimed.is_empty() {
+            return Ok(SettleOutcome::default());
         }
 
-        let (mut outcome, entries) = self.apply_plan(channel, plan, true)?;
-        outcome.requeued = self.requeue_entries(entries);
-        Ok(outcome)
+        let settled = claimed.len();
+        let mut consumer_counts: BTreeMap<ConsumerId, u32> = BTreeMap::new();
+        let mut per_queue: BTreeMap<QueueName, Vec<DeliveryTag>> = BTreeMap::new();
+        for (tag, entry) in &claimed {
+            runtime.release(entry.credit.as_deref());
+            if let Some(credit) = &entry.credit {
+                *consumer_counts.entry(credit.consumer).or_default() += 1;
+            }
+            per_queue.entry(entry.queue.clone()).or_default().push(*tag);
+        }
+
+        let entries = self.take_channel_entries(channel, per_queue)?;
+        let requeued = self.requeue_entries(entries);
+        let credit = Self::credit_signals(channel, &runtime, settled, consumer_counts);
+        Ok(SettleOutcome {
+            settled,
+            requeued,
+            credit,
+        })
     }
 
     /// Dispatches ready messages for one queue to the given sink.
@@ -930,110 +987,102 @@ impl Vhost {
     /// Requeues unacknowledged deliveries on a closing channel and removes its
     /// consumers.
     pub async fn close_channel(&self, channel: ChannelId) -> Result<SettleOutcome, DomainError> {
-        let mut outcome = SettleOutcome::default();
-        let mut entries = Vec::new();
-        let mut to_remove = Vec::new();
+        let runtime = {
+            let mut channels = self
+                .channels
+                .write()
+                .map_err(|_| DomainError::BrokerClosed)?;
+            channels.remove(&channel)
+        };
+        let Some(runtime) = runtime else {
+            return Ok(SettleOutcome::default());
+        };
+        runtime.close();
 
-        for slot in self.snapshot_slots()? {
-            let (removed, consumers) = {
-                let mut consumers = slot
-                    .consumers
-                    .lock()
-                    .map_err(|_| DomainError::BrokerClosed)?;
-                let removed = consumers
-                    .unacked
-                    .remove(&channel)
-                    .map(|unacked| unacked.into_values().collect::<Vec<_>>())
-                    .unwrap_or_default();
-                let removed_consumers: Vec<ConsumerId> = consumers
-                    .consumers
-                    .iter()
-                    .filter(|consumer| consumer.channel == channel)
-                    .map(|consumer| consumer.consumer)
-                    .collect();
-                consumers
-                    .consumers
-                    .retain(|consumer| consumer.channel != channel);
-                if consumers
-                    .cursor
-                    .is_some_and(|cursor| removed_consumers.contains(&cursor))
+        let claimed = runtime.claim_all();
+        let consumers = runtime.take_consumers();
+        if let Ok(mut directory) = self.consumers.write() {
+            for credit in &consumers {
+                directory.remove(&credit.consumer);
+            }
+        }
+
+        let settled = claimed.len();
+        let mut per_queue: BTreeMap<QueueName, Vec<DeliveryTag>> = BTreeMap::new();
+        for (tag, entry) in claimed {
+            runtime.release(entry.credit.as_deref());
+            per_queue.entry(entry.queue).or_default().push(tag);
+        }
+        let entries = self.take_channel_entries(channel, per_queue)?;
+
+        for credit in &consumers {
+            if let Some(slot) = self.maybe_slot(credit.queue.as_str()) {
                 {
-                    consumers.cursor = None;
+                    let mut state = slot
+                        .consumers
+                        .lock()
+                        .map_err(|_| DomainError::BrokerClosed)?;
+                    state.remove_consumer(credit.consumer);
                 }
-                (removed, removed_consumers)
-            };
-
-            for entry in removed {
-                entry.runtime.release_channel_slot();
-                outcome.settled += 1;
-                entries.push((entry.queue, entry.message));
-            }
-            for consumer in consumers {
-                to_remove.push((Arc::clone(&slot), consumer));
+                self.remove_consumer_from_slot(&slot, credit.consumer)?;
             }
         }
 
-        if let Ok(mut channels) = self.channels.write() {
-            channels.remove(&channel);
-        }
-        for (slot, consumer) in to_remove {
-            self.remove_consumer_from_slot(&slot, consumer)?;
-        }
-        outcome.requeued = self.requeue_entries(entries);
-        Ok(outcome)
+        let requeued = self.requeue_entries(entries);
+        Ok(SettleOutcome {
+            settled,
+            requeued,
+            credit: Vec::new(),
+        })
     }
 
     /// Requeues unacknowledged deliveries for a closed connection and removes
     /// its consumers.
     pub async fn close_connection(&self, connection: ConnectionId) -> ConnectionCloseOutcome {
-        let Ok(slots) = self.snapshot_slots() else {
-            return ConnectionCloseOutcome::default();
-        };
-
-        let mut requeued = Vec::new();
-        for slot in &slots {
-            let Ok(mut consumers) = slot.consumers.lock() else {
+        let runtimes: Vec<(ChannelId, Arc<ChannelRuntime>)> = {
+            let Ok(mut channels) = self.channels.write() else {
                 return ConnectionCloseOutcome::default();
             };
-            let channels: Vec<ChannelId> = consumers
-                .unacked
+            let matching: Vec<ChannelId> = channels
                 .iter()
-                .filter(|(_, unacked)| {
-                    unacked
-                        .values()
-                        .any(|entry| entry.runtime.connection() == Some(connection))
-                })
+                .filter(|(_, runtime)| runtime.connection() == Some(connection))
                 .map(|(channel, _)| *channel)
                 .collect();
-            let mut removed = Vec::new();
-            for channel in channels {
-                if let Some(unacked) = consumers.unacked.remove(&channel) {
-                    removed.extend(unacked.into_values());
+            matching
+                .into_iter()
+                .filter_map(|channel| channels.remove(&channel).map(|runtime| (channel, runtime)))
+                .collect()
+        };
+
+        let mut requeued_entries = Vec::new();
+        for (channel, runtime) in runtimes {
+            runtime.close();
+            let claimed = runtime.claim_all();
+            let consumers = runtime.take_consumers();
+            if let Ok(mut directory) = self.consumers.write() {
+                for credit in &consumers {
+                    directory.remove(&credit.consumer);
                 }
             }
-            consumers
-                .consumers
-                .retain(|consumer| consumer.connection != connection);
-            if consumers.cursor.is_some_and(|cursor| {
-                consumers
-                    .consumers
-                    .iter()
-                    .all(|consumer| consumer.consumer != cursor)
-            }) {
-                consumers.cursor = None;
-            }
-            drop(consumers);
 
-            for entry in removed {
-                entry.runtime.release_channel_slot();
-                requeued.push((entry.queue, entry.message));
+            let mut per_queue: BTreeMap<QueueName, Vec<DeliveryTag>> = BTreeMap::new();
+            for (tag, entry) in claimed {
+                runtime.release(entry.credit.as_deref());
+                per_queue.entry(entry.queue).or_default().push(tag);
+            }
+            if let Ok(entries) = self.take_channel_entries(channel, per_queue) {
+                requeued_entries.extend(entries);
+            }
+
+            for credit in &consumers {
+                if let Some(slot) = self.maybe_slot(credit.queue.as_str()) {
+                    if let Ok(mut state) = slot.consumers.lock() {
+                        state.remove_consumer(credit.consumer);
+                    }
+                }
             }
         }
-
-        if let Ok(mut channels) = self.channels.write() {
-            channels.retain(|_, runtime| runtime.connection() != Some(connection));
-        }
-        self.requeue_entries(requeued);
+        self.requeue_entries(requeued_entries);
 
         let names: Vec<QueueName> = self
             .queues
@@ -1441,6 +1490,12 @@ pub struct QueueDeclaration {
 
 fn count_to_u32(count: usize) -> u32 {
     u32::try_from(count).unwrap_or(u32::MAX)
+}
+
+fn duplicate_consumer(consumer: ConsumerId) -> DomainError {
+    DomainError::InvalidArgument {
+        message: format!("consumer {} is already registered", consumer.get()),
+    }
 }
 
 fn unknown_delivery_tag(channel: ChannelId, delivery_tag: DeliveryTag) -> DomainError {

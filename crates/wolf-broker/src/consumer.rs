@@ -6,7 +6,7 @@
 //! unacknowledged messages with the redelivered flag set.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::binding::QueueName;
@@ -688,6 +688,46 @@ impl ConsumerDispatcher {
     }
 }
 
+/// Per-consumer prefetch credit, shared by queue state and the channel index.
+#[derive(Debug)]
+pub(crate) struct ConsumerCredit {
+    pub(crate) consumer: ConsumerId,
+    pub(crate) queue: QueueName,
+    pub(crate) inflight: AtomicU32,
+}
+
+impl ConsumerCredit {
+    pub(crate) fn new(consumer: ConsumerId, queue: QueueName) -> Self {
+        Self {
+            consumer,
+            queue,
+            inflight: AtomicU32::new(0),
+        }
+    }
+
+    pub(crate) fn inflight(&self) -> u32 {
+        self.inflight.load(Ordering::Acquire)
+    }
+}
+
+/// A channel-scoped unacknowledged delivery.
+///
+/// Message bodies live in the owning queue's state; this only records which
+/// queue the tag belongs to and which consumer credit must be released when the
+/// tag is claimed.
+#[derive(Debug, Clone)]
+pub(crate) struct ChannelUnacked {
+    pub(crate) queue: QueueName,
+    pub(crate) credit: Option<Arc<ConsumerCredit>>,
+}
+
+/// Delivery tags and consumer credits owned by one channel.
+#[derive(Debug, Default)]
+pub(crate) struct ChannelIndex {
+    pub(crate) consumers: BTreeMap<ConsumerId, Arc<ConsumerCredit>>,
+    pub(crate) unacked: BTreeMap<DeliveryTag, ChannelUnacked>,
+}
+
 /// Shared per-channel runtime used by queue-owned consumer state.
 ///
 /// Delivery tags and prefetch accounting are channel-wide, while the consumers
@@ -699,6 +739,8 @@ pub(crate) struct ChannelRuntime {
     pub(crate) channel_prefetch: AtomicU32,
     pub(crate) inflight: AtomicU32,
     next_tag: AtomicU64,
+    index: Mutex<ChannelIndex>,
+    closed: AtomicBool,
 }
 
 impl ChannelRuntime {
@@ -709,6 +751,8 @@ impl ChannelRuntime {
             channel_prefetch: AtomicU32::new(0),
             inflight: AtomicU32::new(0),
             next_tag: AtomicU64::new(1),
+            index: Mutex::new(ChannelIndex::default()),
+            closed: AtomicBool::new(false),
         }
     }
 
@@ -725,6 +769,11 @@ impl ChannelRuntime {
         }
     }
 
+    /// Marks the channel closed so no new deliveries enter its index.
+    pub(crate) fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+    }
+
     pub(crate) fn allocate_tag(&self) -> DeliveryTag {
         let mut current = self.next_tag.load(Ordering::Relaxed);
         loop {
@@ -739,6 +788,50 @@ impl ChannelRuntime {
                 Err(actual) => current = actual,
             }
         }
+    }
+
+    /// Reserves one consumer credit slot and one channel-wide slot.
+    ///
+    /// Rolls back the consumer count if either the per-consumer limit or the
+    /// channel limit rejects the reservation.
+    pub(crate) fn try_reserve(&self, credit: &ConsumerCredit) -> bool {
+        if self.closed.load(Ordering::Acquire) {
+            return false;
+        }
+
+        let previous = credit.inflight.fetch_add(1, Ordering::AcqRel);
+        let limit = self.consumer_prefetch.load(Ordering::Acquire);
+        if limit != 0 && previous >= limit {
+            credit.inflight.fetch_sub(1, Ordering::AcqRel);
+            return false;
+        }
+        if !self.reserve_channel_slot() {
+            credit.inflight.fetch_sub(1, Ordering::AcqRel);
+            return false;
+        }
+        true
+    }
+
+    /// Releases one reservation made by [`Self::try_reserve`].
+    pub(crate) fn release(&self, credit: Option<&ConsumerCredit>) {
+        if let Some(credit) = credit {
+            let mut current = credit.inflight.load(Ordering::Acquire);
+            loop {
+                if current == 0 {
+                    break;
+                }
+                match credit.inflight.compare_exchange_weak(
+                    current,
+                    current - 1,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => break,
+                    Err(actual) => current = actual,
+                }
+            }
+        }
+        self.release_channel_slot();
     }
 
     pub(crate) fn reserve_channel_slot(&self) -> bool {
@@ -776,6 +869,11 @@ impl ChannelRuntime {
         }
     }
 
+    /// Reserves a channel slot for `basic.get`, which is not prefetch-limited.
+    pub(crate) fn reserve_get_slot(&self) {
+        self.inflight.fetch_add(1, Ordering::AcqRel);
+    }
+
     pub(crate) fn consumer_credit(&self, inflight: u32) -> u32 {
         let limit = self.consumer_prefetch.load(Ordering::Acquire);
         available_slots(limit, inflight)
@@ -785,23 +883,97 @@ impl ChannelRuntime {
         let limit = self.channel_prefetch.load(Ordering::Acquire);
         available_slots(limit, self.inflight.load(Ordering::Acquire))
     }
+
+    pub(crate) fn insert_unacked(&self, tag: DeliveryTag, entry: ChannelUnacked) -> bool {
+        let Ok(mut index) = self.index.lock() else {
+            return false;
+        };
+        if self.closed.load(Ordering::Acquire) {
+            return false;
+        }
+        index.unacked.insert(tag, entry);
+        true
+    }
+
+    pub(crate) fn claim_tag(&self, tag: DeliveryTag) -> Option<ChannelUnacked> {
+        self.index.lock().ok()?.unacked.remove(&tag)
+    }
+
+    pub(crate) fn claim_tag_if_present(&self, tag: DeliveryTag) -> Option<ChannelUnacked> {
+        self.claim_tag(tag)
+    }
+
+    /// Claims every tag up to and including `tag`, in ascending tag order.
+    ///
+    /// The exact cut tag must already be present, otherwise nothing is claimed.
+    pub(crate) fn claim_range(
+        &self,
+        tag: DeliveryTag,
+    ) -> Option<Vec<(DeliveryTag, ChannelUnacked)>> {
+        let mut index = self.index.lock().ok()?;
+        if !index.unacked.contains_key(&tag) {
+            return None;
+        }
+        let tags: Vec<DeliveryTag> = index.unacked.range(..=tag).map(|(tag, _)| *tag).collect();
+        let mut claimed = Vec::with_capacity(tags.len());
+        for tag in tags {
+            if let Some(entry) = index.unacked.remove(&tag) {
+                claimed.push((tag, entry));
+            }
+        }
+        Some(claimed)
+    }
+
+    pub(crate) fn claim_all(&self) -> Vec<(DeliveryTag, ChannelUnacked)> {
+        match self.index.lock() {
+            Ok(mut index) => std::mem::take(&mut index.unacked).into_iter().collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    pub(crate) fn register_consumer(&self, credit: Arc<ConsumerCredit>) -> bool {
+        let Ok(mut index) = self.index.lock() else {
+            return false;
+        };
+        if self.closed.load(Ordering::Acquire) || index.consumers.contains_key(&credit.consumer) {
+            return false;
+        }
+        index.consumers.insert(credit.consumer, credit);
+        true
+    }
+
+    pub(crate) fn remove_consumer(&self, consumer: ConsumerId) -> Option<Arc<ConsumerCredit>> {
+        self.index.lock().ok()?.consumers.remove(&consumer)
+    }
+
+    pub(crate) fn take_consumers(&self) -> Vec<Arc<ConsumerCredit>> {
+        match self.index.lock() {
+            Ok(mut index) => std::mem::take(&mut index.consumers).into_values().collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    pub(crate) fn consumer_credits(&self) -> Vec<Arc<ConsumerCredit>> {
+        match self.index.lock() {
+            Ok(index) => index.consumers.values().cloned().collect(),
+            Err(_) => Vec::new(),
+        }
+    }
 }
 
 /// A consumer registered on one queue, in queue registration order.
 #[derive(Debug, Clone)]
 pub(crate) struct QueueConsumer {
     pub(crate) consumer: ConsumerId,
-    pub(crate) connection: ConnectionId,
     pub(crate) channel: ChannelId,
     pub(crate) no_ack: bool,
-    pub(crate) inflight: u32,
+    pub(crate) credit: Arc<ConsumerCredit>,
     pub(crate) runtime: Arc<ChannelRuntime>,
 }
 
 /// An unacknowledged delivery owned by one queue.
 #[derive(Debug, Clone)]
 pub(crate) struct QueueUnacked {
-    pub(crate) consumer: Option<ConsumerId>,
     pub(crate) queue: QueueName,
     pub(crate) message: Message,
     pub(crate) runtime: Arc<ChannelRuntime>,
@@ -845,47 +1017,57 @@ impl QueueConsumerState {
 
         for offset in 0..count {
             let index = (start + offset) % count;
-            if self.consumers[index].no_ack {
-                return Some(self.consumers[index].clone());
+            let candidate = &self.consumers[index];
+            if candidate.no_ack {
+                return Some(candidate.clone());
             }
-
-            let runtime = Arc::clone(&self.consumers[index].runtime);
-            let limit = runtime.consumer_prefetch.load(Ordering::Acquire);
-            if limit != 0 && self.consumers[index].inflight >= limit {
+            if !candidate.runtime.try_reserve(&candidate.credit) {
                 continue;
             }
-            if !runtime.reserve_channel_slot() {
-                continue;
-            }
-
-            let candidate = &mut self.consumers[index];
-            candidate.inflight += 1;
             return Some(candidate.clone());
         }
 
         None
     }
 
+    /// Records a delivery in the channel index first, then in the queue.
+    ///
+    /// Returns `None` if the channel closed before the index insert could be
+    /// made; the caller must return the message to the queue. The reservation
+    /// made by [`Self::reserve_next`] is released in that case.
     pub(crate) fn record_delivery(
         &mut self,
         consumer: &QueueConsumer,
         queue: QueueName,
         message: Message,
-    ) -> DeliveryTag {
+    ) -> Option<DeliveryTag> {
         let delivery_tag = consumer.runtime.allocate_tag();
-        if !consumer.no_ack {
-            self.unacked.entry(consumer.channel).or_default().insert(
-                delivery_tag,
-                QueueUnacked {
-                    consumer: Some(consumer.consumer),
-                    queue,
-                    message,
-                    runtime: Arc::clone(&consumer.runtime),
-                },
-            );
+        if consumer.no_ack {
+            self.cursor = Some(consumer.consumer);
+            return Some(delivery_tag);
         }
+
+        if !consumer.runtime.insert_unacked(
+            delivery_tag,
+            ChannelUnacked {
+                queue: queue.clone(),
+                credit: Some(Arc::clone(&consumer.credit)),
+            },
+        ) {
+            consumer.runtime.release(Some(&consumer.credit));
+            return None;
+        }
+
+        self.unacked.entry(consumer.channel).or_default().insert(
+            delivery_tag,
+            QueueUnacked {
+                queue,
+                message,
+                runtime: Arc::clone(&consumer.runtime),
+            },
+        );
         self.cursor = Some(consumer.consumer);
-        delivery_tag
+        Some(delivery_tag)
     }
 }
 
@@ -921,5 +1103,105 @@ fn unknown_delivery_tag(channel: ChannelId, delivery_tag: DeliveryTag) -> Domain
             delivery_tag.get(),
             channel.get()
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn new_runtime() -> ChannelRuntime {
+        ChannelRuntime::new(None)
+    }
+
+    fn credit(consumer: u64, queue: &str) -> Arc<ConsumerCredit> {
+        Arc::new(ConsumerCredit::new(
+            ConsumerId::new(consumer),
+            QueueName::new(queue).expect("valid queue name"),
+        ))
+    }
+
+    fn entry(queue: &str, credit: Option<Arc<ConsumerCredit>>) -> ChannelUnacked {
+        ChannelUnacked {
+            queue: QueueName::new(queue).expect("valid queue name"),
+            credit,
+        }
+    }
+
+    #[test]
+    fn delivery_tags_wrap_from_max_to_one() {
+        let runtime = new_runtime();
+        runtime.next_tag.store(u64::MAX, Ordering::Relaxed);
+
+        assert_eq!(runtime.allocate_tag(), DeliveryTag::new(u64::MAX));
+        assert_eq!(runtime.allocate_tag(), DeliveryTag::new(1));
+    }
+
+    #[test]
+    fn try_reserve_enforces_consumer_and_channel_limits_and_rolls_back() {
+        let runtime = new_runtime();
+        let only = credit(1, "q");
+        runtime.consumer_prefetch.store(1, Ordering::Release);
+
+        assert!(runtime.try_reserve(&only));
+        assert!(!runtime.try_reserve(&only));
+        assert_eq!(only.inflight(), 1);
+        assert_eq!(runtime.inflight.load(Ordering::Acquire), 1);
+
+        runtime.release(Some(&only));
+        assert_eq!(only.inflight(), 0);
+        assert_eq!(runtime.inflight.load(Ordering::Acquire), 0);
+        assert!(runtime.try_reserve(&only));
+
+        let runtime = new_runtime();
+        let first = credit(1, "q");
+        let second = credit(2, "q");
+        runtime.channel_prefetch.store(1, Ordering::Release);
+
+        assert!(runtime.try_reserve(&first));
+        assert!(!runtime.try_reserve(&second));
+        assert_eq!(second.inflight(), 0);
+        assert_eq!(runtime.inflight.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn insert_unacked_fails_after_close() {
+        let runtime = new_runtime();
+        assert!(runtime.insert_unacked(DeliveryTag::new(1), entry("q", None)));
+
+        runtime.close();
+        assert!(!runtime.insert_unacked(DeliveryTag::new(2), entry("q", None)));
+
+        assert!(runtime.claim_tag(DeliveryTag::new(1)).is_some());
+        assert!(runtime.claim_tag(DeliveryTag::new(1)).is_none());
+    }
+
+    #[test]
+    fn claim_range_returns_ascending_tags_and_requires_the_cut_tag() {
+        let runtime = new_runtime();
+        for tag in [1, 2, 3, 5] {
+            assert!(runtime.insert_unacked(DeliveryTag::new(tag), entry("q", None)));
+        }
+
+        assert!(runtime.claim_range(DeliveryTag::new(4)).is_none());
+
+        let claimed = runtime
+            .claim_range(DeliveryTag::new(3))
+            .expect("the cut tag is present");
+        assert_eq!(
+            claimed.iter().map(|(tag, _)| *tag).collect::<Vec<_>>(),
+            vec![
+                DeliveryTag::new(1),
+                DeliveryTag::new(2),
+                DeliveryTag::new(3)
+            ]
+        );
+
+        let remaining = runtime.claim_all();
+        assert_eq!(
+            remaining.iter().map(|(tag, _)| *tag).collect::<Vec<_>>(),
+            vec![DeliveryTag::new(5)]
+        );
+        assert!(runtime.claim_tag(DeliveryTag::new(5)).is_none());
     }
 }
